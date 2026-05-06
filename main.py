@@ -1,3 +1,5 @@
+import argparse
+
 from agent import Agent
 from tools import TOOL_DEFINITIONS, TOOL_FUNCTIONS
 
@@ -14,14 +16,18 @@ SYSTEM_PROMPT = (
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Ollama research agent")
+    parser.add_argument("-m", "--model", default=MODEL, help="Ollama model to use (default: %(default)s)")
+    args = parser.parse_args()
+
     agent = Agent(
-        model=MODEL,
+        model=args.model,
         tool_definitions=TOOL_DEFINITIONS,
         tool_functions=TOOL_FUNCTIONS,
         system_prompt=SYSTEM_PROMPT,
     )
 
-    print(f"Agent ready (model: {MODEL})")
+    print(f"Agent ready (model: {args.model})")
     print("Commands: 'reset' to clear history, 'quit' to exit\n")
 
     while True:
