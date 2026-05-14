@@ -5,7 +5,7 @@ from memory import MemoryStore
 from tools import TOOL_DEFINITIONS, TOOL_FUNCTIONS, make_memory_tools
 
 MODEL = "qwen3.5:latest"
-EMBED_MODEL = ""  # set to e.g. "nomic-embed-text" after: ollama pull nomic-embed-text
+EMBED_MODEL = "qwen3-embedding:latest"  # set to e.g. "nomic-embed-text" after: ollama pull nomic-embed-text
 
 _BASE_SYSTEM_PROMPT = (
     "You are a research assistant with access to tools. "
