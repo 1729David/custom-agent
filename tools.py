@@ -101,6 +101,25 @@ TOOL_FUNCTIONS = {
     "parse_pdf": parse_pdf,
 }
 
+
+def make_memory_tools(store) -> dict:
+    def save_memory(content: str, tags: str = "", source: str = "") -> str:
+        memory_id = store.save(content, tags=tags, source=source)
+        return f"Memory saved (id={memory_id})"
+
+    def search_memories(query: str, limit: int = 5) -> str:
+        rows = store.search(query, limit=limit)
+        if not rows:
+            return "No memories found."
+        parts = []
+        for row in rows:
+            parts.append(
+                f"[id={row['id']} | {row['created_at']} | tags: {row['tags']} | source: {row['source']}]\n{row['content']}"
+            )
+        return "\n\n---\n\n".join(parts)
+
+    return {"save_memory": save_memory, "search_memories": search_memories}
+
 TOOL_DEFINITIONS = [
     {
         "type": "function",
@@ -216,6 +235,60 @@ TOOL_DEFINITIONS = [
                     }
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": (
+                "Save a fact, finding, or piece of information to persistent memory so it can be "
+                "recalled in future sessions. Use when you discover something important during "
+                "research, or when the user tells you something they want you to remember."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The fact or information to remember. Be specific and self-contained — this will be read without the current conversation context.",
+                    },
+                    "tags": {
+                        "type": "string",
+                        "description": "Comma-separated keywords, e.g. 'fusion energy, physics, ITER'. Helps with future recall.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Where this came from — a URL, file path, or 'user'.",
+                    },
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memories",
+            "description": (
+                "Search persistent memory for information relevant to a query. Returns the most "
+                "relevant stored memories from past sessions. Call this at the start of research "
+                "tasks to check if you already know something about the topic."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to search for.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default 5, max 20).",
+                    },
+                },
+                "required": ["query"],
             },
         },
     },
