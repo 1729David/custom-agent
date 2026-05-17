@@ -2,6 +2,7 @@ import argparse
 
 from agent import Agent
 from memory import MemoryStore
+from skills import load_skills
 from tools import TOOL_DEFINITIONS, TOOL_FUNCTIONS, make_memory_tools
 
 MODEL = "qwen3.5:latest"
@@ -45,8 +46,17 @@ def main():
         system_prompt=system_prompt,
     )
 
+    skills = load_skills("skills")
+    for skill in skills.values():
+        if skill.tool_functions:
+            agent.tool_functions.update(skill.tool_functions)
+        if skill.tool_definitions:
+            agent.tool_definitions.extend(skill.tool_definitions)
+
     print(f"Agent ready (model: {args.model})")
-    print("Commands: 'reset' to clear history, 'memory [query]' to inspect memory, 'quit' to exit\n")
+    slash_cmds = ", ".join(f"/{s}" for s in sorted(skills)) if skills else "none"
+    print(f"Skills loaded: {slash_cmds}")
+    print("Commands: 'reset', 'memory [query]', '/help', 'quit'\n")
 
     while True:
         try:
@@ -61,6 +71,31 @@ def main():
         if user_input.lower() in ("quit", "exit"):
             print("Goodbye!")
             break
+
+        if user_input.lower() == "/help":
+            if not skills:
+                print("No skills loaded.\n")
+            else:
+                print("Available skills:")
+                for sname, skill in sorted(skills.items()):
+                    print(f"  /{sname:<16} {skill.description}")
+            print()
+            continue
+
+        if user_input.startswith("/"):
+            parts = user_input[1:].split(None, 1)
+            skill_name = parts[0].lower()
+            query = parts[1] if len(parts) > 1 else ""
+            if skill_name not in skills:
+                print(f"Unknown skill '/{skill_name}'. Type /help for available skills.\n")
+                continue
+            skill = skills[skill_name]
+            original_prompt = agent.system_prompt
+            agent.system_prompt = original_prompt + "\n\n" + skill.system_prompt_addition
+            reply = agent.chat(skill.workflow_prompt.format(query=query))
+            print(f"Agent: {reply}\n")
+            agent.system_prompt = original_prompt
+            continue
 
         if user_input.lower() == "reset":
             agent.reset()
