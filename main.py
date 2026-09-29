@@ -5,7 +5,7 @@ from memory import MemoryStore
 from skills import load_skills
 from tools import TOOL_DEFINITIONS, TOOL_FUNCTIONS, make_memory_tools
 
-MODEL = "qwen3.5:latest"
+MODEL = "qwen3.6:35b"
 EMBED_MODEL = "qwen3-embedding:latest"  # set to e.g. "nomic-embed-text" after: ollama pull nomic-embed-text
 
 _BASE_SYSTEM_PROMPT = (
