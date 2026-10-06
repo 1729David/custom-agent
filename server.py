@@ -30,7 +30,7 @@ class NewsRequest(BaseModel):
 
 
 class Article(BaseModel):
-    article_id: int
+    article_id: int | None = None  # absent in results stored before articles had ids
     title: str | None
     source: str | None
     url: str
