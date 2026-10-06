@@ -80,10 +80,22 @@ API_KEY=changeme uv run uvicorn server:get_app --factory --host 127.0.0.1 --port
 | Endpoint | Description |
 |----------|-------------|
 | `POST /news/{ticker}` | Queue a fetch-and-summarize job. Optional JSON body: `days` (default 30), `max_articles` (default 15). Returns `202` with the job; an identical queued/running job is reused (`200`) |
-| `GET /jobs/{id}` | Job status (`queued`, `running`, `done`, `failed`) and, when done, the result |
+| `GET /jobs/{id}` | Job status (`queued`, `running`, `done`, `failed`), a `progress` block, and, when done, the result |
 | `GET /jobs?status=&limit=` | Job history, newest first |
 
-Send the key as an `X-API-Key` header. If `API_KEY` is unset the API is unauthenticated (a warning is logged), so keep it bound to `127.0.0.1`. Jobs run one at a time. A job interrupted by a restart is marked `failed`.
+Send the key as an `X-API-Key` header. If `API_KEY` is unset the API is unauthenticated (a warning is logged), so keep it bound to `127.0.0.1`.
+
+**How a job runs** (`news_pipeline.py`): list candidate articles from a news search, then for each one in turn fetch it (plain text only; no HTML or screenshots are kept), check it is primarily about the ticker, and summarize it; finally bundle the summaries into an overview. Each article's state is stored in the `job_articles` table (`pending` → `fetched` → `relevant` → `done`, or `skipped` with a `reason`). Jobs run one at a time, and a job interrupted by a restart is re-queued and resumes where it left off.
+
+`progress` in `GET /jobs/{id}` has the current `stage` (`queued`, `listing`, `processing`, `bundling`, `done`, `failed`), the article `total`, per-status `counts`, and each article's `status` and `reason`.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `API_KEY` | unset | Required `X-API-Key` value |
+| `JOBS_DB` | `~/.custom-agent/jobs.db` | SQLite job history |
+| `NEWS_MODEL` | `qwen3.6:35b` | Ollama model for everything below |
+| `NEWS_RELEVANCE_MODEL` | `NEWS_MODEL` | Model for the relevance check (a smaller one works) |
+| `NEWS_SUMMARY_MODEL` | `NEWS_MODEL` | Model for article summaries and the overview |
 
 A finished news job's `result` has `ticker`, `generated_at`, `overview`, and `articles` (each with `title`, `source`, `url`, `published_at`, `retrieved_at`, `summary`), plus `skipped`.
 

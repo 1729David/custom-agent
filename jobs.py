@@ -24,7 +24,33 @@ CREATE TABLE IF NOT EXISTS jobs (
     error       TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs (created_at);
+
+CREATE TABLE IF NOT EXISTS job_articles (
+    job_id              TEXT NOT NULL REFERENCES jobs (id),
+    position            INTEGER NOT NULL,
+    url                 TEXT NOT NULL,
+    title               TEXT,
+    source              TEXT,
+    search_date         TEXT,
+    snippet             TEXT,
+    status              TEXT NOT NULL DEFAULT 'pending',
+    reason              TEXT,
+    published_at        TEXT,
+    published_at_source TEXT,
+    retrieved_at        TEXT,
+    text                TEXT,
+    summary             TEXT,
+    PRIMARY KEY (job_id, url)
+);
 """
+
+# Article states; "done" and "skipped" are terminal.
+_TERMINAL = ("done", "skipped")
+_ARTICLE_FIELDS = {
+    "title", "source", "search_date", "snippet", "status", "reason",
+    "published_at", "published_at_source", "retrieved_at", "text", "summary",
+}
+_PROGRESS_COLUMNS = "url, title, source, status, reason, published_at, retrieved_at"
 
 _JSON_COLUMNS = ("params", "result")
 
@@ -41,14 +67,62 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return job
 
 
+class JobContext:
+    """What a runner gets: the job's per-article rows, readable and updatable."""
+
+    def __init__(self, store: "JobStore", job_id: str):
+        self._store = store
+        self.job_id = job_id
+
+    def articles(self) -> list[dict]:
+        with self._store._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM job_articles WHERE job_id=? ORDER BY position",
+                (self.job_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_articles(self, rows: list[dict]) -> None:
+        """Insert candidate articles (duplicate URLs are ignored), in order."""
+        with self._store._connect() as conn:
+            start = conn.execute(
+                "SELECT COUNT(*) FROM job_articles WHERE job_id=?", (self.job_id,)
+            ).fetchone()[0]
+            for i, row in enumerate(rows, start=start):
+                conn.execute(
+                    "INSERT OR IGNORE INTO job_articles "
+                    "(job_id, position, url, title, source, search_date, snippet) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (self.job_id, i, row["url"], row.get("title"), row.get("source"),
+                     row.get("search_date"), row.get("snippet")),
+                )
+
+    def update_article(self, url: str, **fields) -> None:
+        unknown = set(fields) - _ARTICLE_FIELDS
+        if unknown:
+            raise ValueError(f"unknown article fields: {sorted(unknown)}")
+        assignments = ", ".join(f"{k}=?" for k in fields)
+        with self._store._connect() as conn:
+            conn.execute(
+                f"UPDATE job_articles SET {assignments} WHERE job_id=? AND url=?",
+                (*fields.values(), self.job_id, url),
+            )
+
+
 class JobStore:
     """SQLite-backed job history plus a single worker thread that runs the jobs.
 
-    One worker means one job at a time, which protects Ollama and Playwright.
-    Jobs are never purged, so the table doubles as a record of what ran when.
+    One worker means one job at a time, which protects Ollama. Jobs are never
+    purged, so the table doubles as a record of what ran when. A runner is called
+    as runner(ctx, **params) with a JobContext; because it persists its progress
+    through ctx, a job interrupted by a restart is simply run again and resumes.
     """
 
-    def __init__(self, runners: dict[str, Callable[..., dict]], db_path: Path = DB_PATH):
+    def __init__(
+        self,
+        runners: dict[str, Callable[..., dict]],
+        db_path: Path = DB_PATH,
+    ):
         self.runners = runners
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -65,13 +139,9 @@ class JobStore:
         return conn
 
     def _recover(self) -> None:
-        """After a restart: fail jobs that were mid-run, re-queue ones never started."""
+        """After a restart: re-queue jobs that were mid-run or never started."""
         with self._connect() as conn:
-            conn.execute(
-                "UPDATE jobs SET status='failed', finished_at=?, "
-                "error='interrupted by server restart' WHERE status='running'",
-                (_now(),),
-            )
+            conn.execute("UPDATE jobs SET status='queued' WHERE status='running'")
             queued = conn.execute(
                 "SELECT id FROM jobs WHERE status='queued' ORDER BY created_at"
             ).fetchall()
@@ -114,6 +184,30 @@ class JobStore:
             row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return _row_to_dict(row) if row else None
 
+    def progress(self, job: dict) -> dict | None:
+        """Stage, per-status article counts and per-article state for a job."""
+        if job["status"] == "queued":
+            return {"stage": "queued", "total": 0, "counts": {}, "articles": []}
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {_PROGRESS_COLUMNS} FROM job_articles "
+                "WHERE job_id=? ORDER BY position",
+                (job["id"],),
+            ).fetchall()
+        articles = [dict(r) for r in rows]
+        counts: dict[str, int] = {}
+        for a in articles:
+            counts[a["status"]] = counts.get(a["status"], 0) + 1
+        if job["status"] in ("done", "failed"):
+            stage = job["status"]
+        elif not articles:
+            stage = "listing"
+        elif any(a["status"] not in _TERMINAL for a in articles):
+            stage = "processing"
+        else:
+            stage = "bundling"
+        return {"stage": stage, "total": len(articles), "counts": counts, "articles": articles}
+
     def list(self, limit: int = 50, status: str | None = None) -> list[dict]:
         sql, args = "SELECT * FROM jobs", []
         if status:
@@ -138,7 +232,7 @@ class JobStore:
                     (_now(), job_id),
                 )
             try:
-                result = self.runners[job["kind"]](**job["params"])
+                result = self.runners[job["kind"]](JobContext(self, job_id), **job["params"])
                 status, result_json, error = "done", json.dumps(result), None
             except Exception as e:
                 status, result_json, error = "failed", None, f"{type(e).__name__}: {e}"

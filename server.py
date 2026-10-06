@@ -1,16 +1,15 @@
-import importlib.util
 import logging
 import os
 import re
 import secrets
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 from jobs import JobStore
+from news_pipeline import run_news_job
 
 log = logging.getLogger("server")
 
@@ -18,14 +17,6 @@ API_KEY = os.environ.get("API_KEY")
 _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
 JobStatus = Literal["queued", "running", "done", "failed"]
-
-
-def _load_skill_module(name: str):
-    path = Path(__file__).parent / "skills" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
 
 
 class NewsRequest(BaseModel):
@@ -57,6 +48,23 @@ class NewsResult(BaseModel):
     skipped: list[SkippedArticle]
 
 
+class ArticleProgress(BaseModel):
+    url: str
+    title: str | None
+    source: str | None
+    status: Literal["pending", "fetched", "relevant", "done", "skipped"]
+    reason: str | None
+    published_at: str | None
+    retrieved_at: str | None
+
+
+class Progress(BaseModel):
+    stage: Literal["queued", "listing", "processing", "bundling", "done", "failed"]
+    total: int
+    counts: dict[str, int]
+    articles: list[ArticleProgress]
+
+
 class Job(BaseModel):
     id: str
     kind: str
@@ -67,6 +75,7 @@ class Job(BaseModel):
     finished_at: str | None
     result: NewsResult | None
     error: str | None
+    progress: Progress | None = None
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
@@ -78,8 +87,7 @@ def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
 
 def create_app(store: JobStore | None = None) -> FastAPI:
     if store is None:
-        news = _load_skill_module("news")
-        store = JobStore({"news": news.get_news_report})
+        store = JobStore({"news": run_news_job})
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -110,13 +118,14 @@ def create_app(store: JobStore | None = None) -> FastAPI:
         job = store.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
+        job["progress"] = store.progress(job)
         return job
 
     @app.get("/jobs", response_model=list[Job], dependencies=auth)
     def list_jobs(
         status: JobStatus | None = None, limit: int = Query(50, ge=1, le=500)
     ):
-        """Job history, newest first."""
+        """Job history, newest first (without progress; use GET /jobs/{id} for that)."""
         return store.list(limit=limit, status=status)
 
     return app

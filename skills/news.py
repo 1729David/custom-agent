@@ -1,23 +1,29 @@
 import hashlib
 import json
 import os
-import re
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
-import ollama
 from bs4 import BeautifulSoup
-from ddgs import DDGS
+
+from news_pipeline import (
+    _ARTICLE_TEXT_LIMIT,
+    _HEADERS,
+    _TS_FORMAT,
+    NEWS_MODEL,
+    _chat,
+    _extract_published,
+    _now,
+    _page_text,
+    _search,
+    check_relevance,
+)
 
 NAME = "news"
 DESCRIPTION = "Archive the past month of news for a stock ticker, then summarize it"
 
-NEWS_MODEL = os.environ.get("NEWS_MODEL", "qwen3.6:35b")
 NEWS_DIR = Path(os.path.expanduser(os.environ.get("NEWS_DIR", "~/.custom-agent/news")))
-_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-agent/1.0)"}
-_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-_ARTICLE_TEXT_LIMIT = 8000
 
 SYSTEM_PROMPT_ADDITION = (
     "You are archiving and summarizing recent news about a public company's stock. "
@@ -35,72 +41,6 @@ Step 2 — Summarize: call summarize_stock_news with the same ticker.
 Step 3 — Report: show the overview returned by summarize_stock_news, then list each article with its title, source, published date, retrieval date, and the folder where the original is stored. Mention any articles that had no screenshot or no published date."""
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _parse_date(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def _json_ld_dates(soup: BeautifulSoup):
-    for tag in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(tag.string or "")
-        except ValueError:
-            continue
-        stack = [data]
-        while stack:
-            node = stack.pop()
-            if isinstance(node, list):
-                stack.extend(node)
-            elif isinstance(node, dict):
-                if node.get("datePublished"):
-                    yield node["datePublished"]
-                stack.extend(node.get("@graph", []))
-
-
-def _extract_published(soup: BeautifulSoup, fallback: str | None):
-    """Return (datetime, source) using the most reliable date found in the page."""
-    for attrs in (
-        {"property": "article:published_time"},
-        {"name": "article:published_time"},
-        {"itemprop": "datePublished"},
-        {"name": "date"},
-    ):
-        tag = soup.find("meta", attrs=attrs)
-        dt = _parse_date(tag.get("content") if tag else None)
-        if dt:
-            return dt, "meta_tag"
-    for value in _json_ld_dates(soup):
-        dt = _parse_date(value)
-        if dt:
-            return dt, "json_ld"
-    time_tag = soup.find("time", attrs={"datetime": True})
-    dt = _parse_date(time_tag["datetime"] if time_tag else None)
-    if dt:
-        return dt, "time_tag"
-    dt = _parse_date(fallback)
-    if dt:
-        return dt, "search_result"
-    return None, None
-
-
-def _page_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-        tag.decompose()
-    return re.sub(r"\n{3,}", "\n\n", soup.get_text(separator="\n", strip=True))
-
-
 def _screenshot(page, url: str, path: Path) -> bool:
     try:
         page.goto(url, timeout=20_000, wait_until="domcontentloaded")
@@ -109,41 +49,6 @@ def _screenshot(page, url: str, path: Path) -> bool:
         return True
     except Exception:
         return False
-
-
-def _search(ticker: str, max_results: int) -> list[dict]:
-    seen: dict[str, dict] = {}
-    for query in (f"{ticker} stock", f"{ticker} shares earnings"):
-        try:
-            results = DDGS().news(query, timelimit="m", max_results=max_results)
-        except Exception:
-            continue
-        for r in results:
-            url = r.get("url")
-            if url and url not in seen:
-                seen[url] = r
-    return list(seen.values())
-
-
-def _is_about_ticker(ticker: str, title: str, text: str, model: str) -> bool:
-    """Ask the model whether the article is primarily about the ticker's company.
-
-    Fails open (returns True) if the model can't be reached, so an Ollama outage
-    doesn't silently discard every article.
-    """
-    prompt = (
-        f"Stock ticker: {ticker}\n\n"
-        f"Title: {title}\n\n{text[:3000]}\n\n"
-        f"Is this article primarily about the company with ticker {ticker}? "
-        "Answer NO if it is mainly about a different company, or only mentions "
-        f"{ticker} in passing (e.g. in a list of stocks or a comparison). "
-        "Reply with exactly one word: YES or NO."
-    )
-    try:
-        answer = _chat(model, prompt)
-    except Exception:
-        return True
-    return answer.upper().lstrip("*`\" ").startswith("YES")
 
 
 def fetch_news(ticker: str, days: int = 30, max_articles: int = 15) -> dict:
@@ -196,7 +101,7 @@ def fetch_news(ticker: str, days: int = 30, max_articles: int = 15) -> dict:
             text = _page_text(resp.text)
             if len(text) < 200:
                 text = r.get("body") or text
-            if not _is_about_ticker(ticker, title, text, NEWS_MODEL):
+            if not check_relevance(ticker, title, text):
                 skipped.append({"url": url, "title": title, "reason": f"not primarily about {ticker}"})
                 continue
 
@@ -241,11 +146,6 @@ def fetch_stock_news(ticker: str, days: int = 30, max_articles: int = 15) -> str
         )
     except Exception as e:
         return f"Error: {e}"
-
-
-def _chat(model: str, prompt: str) -> str:
-    resp = ollama.chat(model=model, messages=[{"role": "user", "content": prompt}])
-    return resp["message"]["content"].strip()
 
 
 def summarize_news(
@@ -317,22 +217,6 @@ def summarize_stock_news(ticker: str, model: str | None = None) -> str:
         return f"No archived articles for {ticker.strip().upper()}. Run fetch_stock_news first."
     except Exception as e:
         return f"Error: {e}"
-
-
-def get_news_report(
-    ticker: str, days: int = 30, max_articles: int = 15, model: str | None = None
-) -> dict:
-    """Fetch and summarize in one step, scoped to the articles from this fetch.
-
-    Raises LookupError if no usable articles were found.
-    """
-    fetched = fetch_news(ticker, days, max_articles)
-    ids = [a["id"] for a in fetched["saved"]]
-    if not ids:
-        raise LookupError(f"No usable news found for {fetched['ticker']}.")
-    report = summarize_news(ticker, model, article_ids=ids)
-    report["skipped"] = fetched["skipped"]
-    return report
 
 
 TOOL_FUNCTIONS = {
