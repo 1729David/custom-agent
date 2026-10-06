@@ -125,6 +125,27 @@ def _search(ticker: str, max_results: int) -> list[dict]:
     return list(seen.values())
 
 
+def _is_about_ticker(ticker: str, title: str, text: str, model: str) -> bool:
+    """Ask the model whether the article is primarily about the ticker's company.
+
+    Fails open (returns True) if the model can't be reached, so an Ollama outage
+    doesn't silently discard every article.
+    """
+    prompt = (
+        f"Stock ticker: {ticker}\n\n"
+        f"Title: {title}\n\n{text[:3000]}\n\n"
+        f"Is this article primarily about the company with ticker {ticker}? "
+        "Answer NO if it is mainly about a different company, or only mentions "
+        f"{ticker} in passing (e.g. in a list of stocks or a comparison). "
+        "Reply with exactly one word: YES or NO."
+    )
+    try:
+        answer = _chat(model, prompt)
+    except Exception:
+        return True
+    return answer.upper().lstrip("*`\" ").startswith("YES")
+
+
 def fetch_stock_news(ticker: str, days: int = 30, max_articles: int = 15) -> str:
     try:
         ticker = ticker.strip().upper()
@@ -167,6 +188,14 @@ def fetch_stock_news(ticker: str, days: int = 30, max_articles: int = 15) -> str
                     skipped.append({"url": url, "reason": "older than window"})
                     continue
 
+                title = r.get("title") or (soup.title.string if soup.title else "")
+                text = _page_text(resp.text)
+                if len(text) < 200:
+                    text = r.get("body") or text
+                if not _is_about_ticker(ticker, title, text, NEWS_MODEL):
+                    skipped.append({"url": url, "title": title, "reason": f"not primarily about {ticker}"})
+                    continue
+
                 slug = hashlib.sha1(url.encode()).hexdigest()[:10]
                 stamp = (published or retrieved).strftime("%Y%m%d")
                 art_dir = folder / f"{stamp}_{slug}"
@@ -178,7 +207,7 @@ def fetch_stock_news(ticker: str, days: int = 30, max_articles: int = 15) -> str
                 )
                 meta = {
                     "url": url,
-                    "title": r.get("title") or (soup.title.string if soup.title else ""),
+                    "title": title,
                     "source": r.get("source"),
                     "ticker": ticker,
                     "retrieved_at": retrieved.strftime(_TS_FORMAT),
