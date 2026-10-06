@@ -67,12 +67,30 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return job
 
 
+class JobInterrupted(Exception):
+    """Raised by JobContext.checkpoint() when the job was asked to pause or cancel."""
+
+    def __init__(self, action: str):
+        super().__init__(action)
+        self.action = action  # "pause" or "cancel"
+
+
+class InvalidTransition(ValueError):
+    """The requested pause/resume/cancel doesn't apply to the job's current state."""
+
+
 class JobContext:
     """What a runner gets: the job's per-article rows, readable and updatable."""
 
     def __init__(self, store: "JobStore", job_id: str):
         self._store = store
         self.job_id = job_id
+
+    def checkpoint(self) -> None:
+        """Call between steps; raises JobInterrupted if a pause/cancel was requested."""
+        action = self._store._control.get(self.job_id)
+        if action:
+            raise JobInterrupted(action)
 
     def articles(self) -> list[dict]:
         with self._store._connect() as conn:
@@ -116,6 +134,9 @@ class JobStore:
     purged, so the table doubles as a record of what ran when. A runner is called
     as runner(ctx, **params) with a JobContext; because it persists its progress
     through ctx, a job interrupted by a restart is simply run again and resumes.
+
+    Pause and cancel are cooperative: a request on a running job takes effect at
+    the runner's next ctx.checkpoint(), so the step in flight finishes first.
     """
 
     def __init__(
@@ -127,6 +148,8 @@ class JobStore:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._create_lock = threading.Lock()
+        self._control_lock = threading.Lock()
+        self._control: dict[str, str] = {}  # job_id -> "pause" | "cancel"
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         with self._connect() as conn:
@@ -158,14 +181,14 @@ class JobStore:
             self._thread.join(timeout=5)
 
     def submit(self, kind: str, params: dict) -> tuple[dict, bool]:
-        """Queue a job. Returns (job, created); an identical active job is reused."""
+        """Queue a job. Returns (job, created); an identical active or paused job is reused."""
         if kind not in self.runners:
             raise ValueError(f"unknown job kind: {kind}")
         params_json = json.dumps(params, sort_keys=True)
         with self._create_lock, self._connect() as conn:
             existing = conn.execute(
                 "SELECT * FROM jobs WHERE kind=? AND params=? "
-                "AND status IN ('queued','running') ORDER BY created_at LIMIT 1",
+                "AND status IN ('queued','running','paused') ORDER BY created_at LIMIT 1",
                 (kind, params_json),
             ).fetchone()
             if existing:
@@ -184,6 +207,54 @@ class JobStore:
             row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return _row_to_dict(row) if row else None
 
+    def _set_status(self, job_id: str, status: str, error: str | None = None, finished: bool = False):
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE jobs SET status=?, error=?, finished_at=? WHERE id=?",
+                (status, error, _now() if finished else None, job_id),
+            )
+
+    def pause(self, job_id: str) -> dict:
+        """Pause a queued job now, or a running one at its next checkpoint."""
+        with self._control_lock:
+            job = self._require(job_id)
+            if job["status"] == "queued":
+                self._set_status(job_id, "paused")
+            elif job["status"] == "running":
+                if self._control.get(job_id) == "cancel":
+                    raise InvalidTransition("job is being cancelled")
+                self._control[job_id] = "pause"
+            else:
+                raise InvalidTransition(f"cannot pause a {job['status']} job")
+        return self.get(job_id)
+
+    def resume(self, job_id: str) -> dict:
+        with self._control_lock:
+            job = self._require(job_id)
+            if job["status"] != "paused":
+                raise InvalidTransition(f"cannot resume a {job['status']} job")
+            self._set_status(job_id, "queued")
+        self._queue.put(job_id)
+        return self.get(job_id)
+
+    def cancel(self, job_id: str) -> dict:
+        """Fail a queued or paused job now, or a running one at its next checkpoint."""
+        with self._control_lock:
+            job = self._require(job_id)
+            if job["status"] in ("queued", "paused"):
+                self._set_status(job_id, "failed", "cancelled by user", finished=True)
+            elif job["status"] == "running":
+                self._control[job_id] = "cancel"
+            else:
+                raise InvalidTransition(f"cannot cancel a {job['status']} job")
+        return self.get(job_id)
+
+    def _require(self, job_id: str) -> dict:
+        job = self.get(job_id)
+        if job is None:
+            raise KeyError(job_id)
+        return job
+
     def progress(self, job: dict) -> dict | None:
         """Stage, per-status article counts and per-article state for a job."""
         if job["status"] == "queued":
@@ -198,8 +269,11 @@ class JobStore:
         counts: dict[str, int] = {}
         for a in articles:
             counts[a["status"]] = counts.get(a["status"], 0) + 1
-        if job["status"] in ("done", "failed"):
+        pending_action = self._control.get(job["id"]) if job["status"] == "running" else None
+        if job["status"] in ("done", "failed", "paused"):
             stage = job["status"]
+        elif pending_action:
+            stage = "pausing" if pending_action == "pause" else "cancelling"
         elif not articles:
             stage = "listing"
         elif any(a["status"] not in _TERMINAL for a in articles):
@@ -228,16 +302,22 @@ class JobStore:
                 continue
             with self._connect() as conn:
                 conn.execute(
-                    "UPDATE jobs SET status='running', started_at=? WHERE id=?",
+                    "UPDATE jobs SET status='running', started_at=COALESCE(started_at, ?) WHERE id=?",
                     (_now(), job_id),
                 )
             try:
                 result = self.runners[job["kind"]](JobContext(self, job_id), **job["params"])
                 status, result_json, error = "done", json.dumps(result), None
+            except JobInterrupted as e:
+                if e.action == "pause":
+                    status, result_json, error = "paused", None, None
+                else:
+                    status, result_json, error = "failed", None, "cancelled by user"
             except Exception as e:
                 status, result_json, error = "failed", None, f"{type(e).__name__}: {e}"
-            with self._connect() as conn:
+            with self._control_lock, self._connect() as conn:
                 conn.execute(
                     "UPDATE jobs SET status=?, finished_at=?, result=?, error=? WHERE id=?",
-                    (status, _now(), result_json, error, job_id),
+                    (status, None if status == "paused" else _now(), result_json, error, job_id),
                 )
+                self._control.pop(job_id, None)

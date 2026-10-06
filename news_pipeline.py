@@ -251,7 +251,8 @@ def build_report(ticker: str, articles: list[dict], model: str | None = None) ->
 def run_news_job(ctx, ticker: str, days: int = 30, max_articles: int = 15) -> dict:
     """Run the pipeline one article at a time, persisting state through ctx.
 
-    ctx provides articles(), add_articles(rows) and update_article(url, **fields).
+    ctx provides articles(), add_articles(rows), update_article(url, **fields) and
+    checkpoint(), which raises to pause or cancel the job between steps.
     Article status advances pending -> fetched -> relevant -> done (or skipped), so
     calling this again on the same ctx resumes where the previous run stopped.
     Raises LookupError if no usable articles were found.
@@ -259,6 +260,7 @@ def run_news_job(ctx, ticker: str, days: int = 30, max_articles: int = 15) -> di
     ticker = ticker.strip().upper()
     cutoff = _now() - timedelta(days=int(days))
 
+    ctx.checkpoint()
     if not ctx.articles():
         candidates = list_articles(ticker, max_articles)
         if not candidates:
@@ -282,6 +284,7 @@ def run_news_job(ctx, ticker: str, days: int = 30, max_articles: int = 15) -> di
             continue
 
         if art["status"] == "pending":
+            ctx.checkpoint()
             try:
                 info = fetch_article(art, cutoff)
             except ArticleSkipped as e:
@@ -290,6 +293,7 @@ def run_news_job(ctx, ticker: str, days: int = 30, max_articles: int = 15) -> di
             advance(status="fetched", **info)
 
         if art["status"] == "fetched":
+            ctx.checkpoint()
             if not check_relevance(ticker, art["title"], art["text"]):
                 advance(status="skipped", reason=f"not primarily about {ticker}")
                 continue
@@ -297,9 +301,11 @@ def run_news_job(ctx, ticker: str, days: int = 30, max_articles: int = 15) -> di
             advance(status="relevant")
 
         if art["status"] == "relevant":
+            ctx.checkpoint()
             summary = summarize_article(ticker, art["title"], art["text"])
             advance(status="done", summary=summary)
 
+    ctx.checkpoint()
     done = [a for a in ctx.articles() if a["status"] == "done"]
     if not done:
         raise LookupError(f"No usable news found for {ticker}.")

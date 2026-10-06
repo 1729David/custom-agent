@@ -8,7 +8,7 @@ from typing import Literal
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
-from jobs import JobStore
+from jobs import InvalidTransition, JobStore
 from news_pipeline import run_news_job
 
 log = logging.getLogger("server")
@@ -16,7 +16,7 @@ log = logging.getLogger("server")
 API_KEY = os.environ.get("API_KEY")
 _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
 
-JobStatus = Literal["queued", "running", "done", "failed"]
+JobStatus = Literal["queued", "running", "paused", "done", "failed"]
 
 
 class NewsRequest(BaseModel):
@@ -59,7 +59,10 @@ class ArticleProgress(BaseModel):
 
 
 class Progress(BaseModel):
-    stage: Literal["queued", "listing", "processing", "bundling", "done", "failed"]
+    stage: Literal[
+        "queued", "listing", "processing", "bundling",
+        "pausing", "cancelling", "paused", "done", "failed",
+    ]
     total: int
     counts: dict[str, int]
     articles: list[ArticleProgress]
@@ -120,6 +123,31 @@ def create_app(store: JobStore | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="job not found")
         job["progress"] = store.progress(job)
         return job
+
+    def _control(action, job_id: str) -> dict:
+        try:
+            job = action(job_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="job not found")
+        except InvalidTransition as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        job["progress"] = store.progress(job)
+        return job
+
+    @app.post("/jobs/{job_id}/pause", response_model=Job, dependencies=auth)
+    def pause_job(job_id: str):
+        """Pause a job. A running job pauses at its next step (stage becomes "pausing")."""
+        return _control(store.pause, job_id)
+
+    @app.post("/jobs/{job_id}/resume", response_model=Job, dependencies=auth)
+    def resume_job(job_id: str):
+        """Re-queue a paused job; it continues where it left off."""
+        return _control(store.resume, job_id)
+
+    @app.post("/jobs/{job_id}/cancel", response_model=Job, dependencies=auth)
+    def cancel_job(job_id: str):
+        """Fail a job with error "cancelled by user" (a running job at its next step)."""
+        return _control(store.cancel, job_id)
 
     @app.get("/jobs", response_model=list[Job], dependencies=auth)
     def list_jobs(
