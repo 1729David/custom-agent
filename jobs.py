@@ -1,56 +1,78 @@
 import json
 import os
 import queue
+import shutil
 import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 DB_PATH = Path(os.path.expanduser(os.environ.get("JOBS_DB", "~/.custom-agent/jobs.db")))
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS jobs (
-    id          TEXT PRIMARY KEY,
-    kind        TEXT NOT NULL,
-    params      TEXT NOT NULL,
-    status      TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    started_at  TEXT,
-    finished_at TEXT,
-    result      TEXT,
-    error       TEXT
-);
-CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs (created_at);
+# jobs and articles are many-to-many through job_articles, which also carries the
+# per-job state of each candidate. An article row is one retrieval of a URL; a
+# forced refresh adds a new row. article_analysis holds the ticker-specific
+# results (relevance verdict, summary) so later jobs can reuse them.
+_SCHEMA_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS jobs (
+        id          TEXT PRIMARY KEY,
+        kind        TEXT NOT NULL,
+        params      TEXT NOT NULL,
+        status      TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        started_at  TEXT,
+        finished_at TEXT,
+        result      TEXT,
+        error       TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs (created_at)",
+    """CREATE TABLE IF NOT EXISTS articles (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        url                 TEXT NOT NULL,
+        url_key             TEXT NOT NULL,
+        title               TEXT,
+        source              TEXT,
+        published_at        TEXT,
+        published_at_source TEXT,
+        retrieved_at        TEXT NOT NULL,
+        text                TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS articles_url_key ON articles (url_key, id)",
+    """CREATE TABLE IF NOT EXISTS article_analysis (
+        article_id INTEGER NOT NULL REFERENCES articles (id),
+        ticker     TEXT NOT NULL,
+        relevant   INTEGER,
+        summary    TEXT,
+        PRIMARY KEY (article_id, ticker)
+    )""",
+    """CREATE TABLE IF NOT EXISTS job_articles (
+        job_id      TEXT NOT NULL REFERENCES jobs (id),
+        position    INTEGER NOT NULL,
+        url         TEXT NOT NULL,
+        title       TEXT,
+        source      TEXT,
+        search_date TEXT,
+        snippet     TEXT,
+        status      TEXT NOT NULL DEFAULT 'pending',
+        reason      TEXT,
+        article_id  INTEGER REFERENCES articles (id),
+        reused      INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (job_id, url)
+    )""",
+)
 
-CREATE TABLE IF NOT EXISTS job_articles (
-    job_id              TEXT NOT NULL REFERENCES jobs (id),
-    position            INTEGER NOT NULL,
-    url                 TEXT NOT NULL,
-    title               TEXT,
-    source              TEXT,
-    search_date         TEXT,
-    snippet             TEXT,
-    status              TEXT NOT NULL DEFAULT 'pending',
-    reason              TEXT,
-    published_at        TEXT,
-    published_at_source TEXT,
-    retrieved_at        TEXT,
-    text                TEXT,
-    summary             TEXT,
-    PRIMARY KEY (job_id, url)
-);
-"""
-
-# Article states; "done" and "skipped" are terminal.
+# Job-article states; "done" and "skipped" are terminal.
 _TERMINAL = ("done", "skipped")
-_ARTICLE_FIELDS = {
-    "title", "source", "search_date", "snippet", "status", "reason",
-    "published_at", "published_at_source", "retrieved_at", "text", "summary",
-}
-_PROGRESS_COLUMNS = "url, title, source, status, reason, published_at, retrieved_at"
+_JOB_ARTICLE_FIELDS = {"status", "reason", "article_id", "reused"}
+_ARTICLE_COLUMNS = (
+    "title", "source", "published_at", "published_at_source", "retrieved_at", "text",
+)
+
+_TRACKING_PARAMS = {"fbclid", "gclid", "mc_cid", "mc_eid", "ocid", "cmpid", "ref", "ref_src"}
 
 _JSON_COLUMNS = ("params", "result")
 
@@ -67,6 +89,27 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     return job
 
 
+def _article_row(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    if d.get("relevant") is not None:
+        d["relevant"] = bool(d["relevant"])
+    if "reused" in d:
+        d["reused"] = bool(d["reused"])
+    return d
+
+
+def normalize_url(url: str) -> str:
+    """Canonical form of a URL, used to recognize the same article across jobs."""
+    parts = urlsplit(url.strip())
+    query = sorted(
+        (k, v)
+        for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if not k.lower().startswith("utm_") and k.lower() not in _TRACKING_PARAMS
+    )
+    path = parts.path.rstrip("/") or "/"
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, urlencode(query), ""))
+
+
 class JobInterrupted(Exception):
     """Raised by JobContext.checkpoint() when the job was asked to pause or cancel."""
 
@@ -80,11 +123,17 @@ class InvalidTransition(ValueError):
 
 
 class JobContext:
-    """What a runner gets: the job's per-article rows, readable and updatable."""
+    """What a runner gets: this job's candidate articles, plus the shared article store.
+
+    articles() returns each candidate joined with its retrieved article (text,
+    dates) and its analysis for this job's ticker, when those exist.
+    """
 
     def __init__(self, store: "JobStore", job_id: str):
         self._store = store
         self.job_id = job_id
+        job = store.get(job_id)
+        self.ticker = (job["params"] or {}).get("ticker") if job else None
 
     def checkpoint(self) -> None:
         """Call between steps; raises JobInterrupted if a pause/cancel was requested."""
@@ -95,10 +144,18 @@ class JobContext:
     def articles(self) -> list[dict]:
         with self._store._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM job_articles WHERE job_id=? ORDER BY position",
-                (self.job_id,),
+                """SELECT j.url, COALESCE(a.title, j.title) AS title, j.source,
+                          j.search_date, j.snippet, j.status, j.reason, j.article_id,
+                          j.reused, a.published_at, a.published_at_source,
+                          a.retrieved_at, a.text, an.relevant, an.summary
+                   FROM job_articles j
+                   LEFT JOIN articles a ON a.id = j.article_id
+                   LEFT JOIN article_analysis an
+                          ON an.article_id = a.id AND an.ticker = ?
+                   WHERE j.job_id = ? ORDER BY j.position""",
+                (self.ticker, self.job_id),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [_article_row(r) for r in rows]
 
     def add_articles(self, rows: list[dict]) -> None:
         """Insert candidate articles (duplicate URLs are ignored), in order."""
@@ -116,14 +173,54 @@ class JobContext:
                 )
 
     def update_article(self, url: str, **fields) -> None:
-        unknown = set(fields) - _ARTICLE_FIELDS
+        """Update this job's state for a candidate (status, reason, article_id, reused)."""
+        unknown = set(fields) - _JOB_ARTICLE_FIELDS
         if unknown:
-            raise ValueError(f"unknown article fields: {sorted(unknown)}")
+            raise ValueError(f"unknown job-article fields: {sorted(unknown)}")
         assignments = ", ".join(f"{k}=?" for k in fields)
         with self._store._connect() as conn:
             conn.execute(
                 f"UPDATE job_articles SET {assignments} WHERE job_id=? AND url=?",
                 (*fields.values(), self.job_id, url),
+            )
+
+    def cached_article(self, url: str) -> dict | None:
+        """The most recent retrieval of this URL by any job, with its analysis."""
+        with self._store._connect() as conn:
+            row = conn.execute(
+                """SELECT a.id AS article_id, a.title, a.published_at,
+                          a.published_at_source, a.retrieved_at, a.text,
+                          an.relevant, an.summary
+                   FROM articles a
+                   LEFT JOIN article_analysis an
+                          ON an.article_id = a.id AND an.ticker = ?
+                   WHERE a.url_key = ? ORDER BY a.id DESC LIMIT 1""",
+                (self.ticker, normalize_url(url)),
+            ).fetchone()
+        return _article_row(row) if row else None
+
+    def store_article(self, url: str, info: dict) -> int:
+        """Save a newly retrieved article (always a new row) and return its id."""
+        values = [info.get(c) for c in _ARTICLE_COLUMNS]
+        with self._store._connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO articles (url, url_key, title, source, published_at, "
+                "published_at_source, retrieved_at, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, normalize_url(url), *values),
+            )
+            return cur.lastrowid
+
+    def store_analysis(
+        self, article_id: int, relevant: bool | None = None, summary: str | None = None
+    ) -> None:
+        """Record this ticker's relevance verdict and/or summary for an article."""
+        with self._store._connect() as conn:
+            conn.execute(
+                "INSERT INTO article_analysis (article_id, ticker, relevant, summary) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (article_id, ticker) DO UPDATE SET "
+                "relevant=COALESCE(excluded.relevant, relevant), "
+                "summary=COALESCE(excluded.summary, summary)",
+                (article_id, self.ticker, None if relevant is None else int(relevant), summary),
             )
 
 
@@ -152,14 +249,77 @@ class JobStore:
         self._control: dict[str, str] = {}  # job_id -> "pause" | "cancel"
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._thread: threading.Thread | None = None
+        self._migrate()
         with self._connect() as conn:
-            conn.executescript(_SCHEMA)
+            for statement in _SCHEMA_STATEMENTS:
+                conn.execute(statement)
         self._recover()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def _migrate(self) -> None:
+        """Move an old job_articles table (article data inline) to the shared schema.
+
+        Each old row that has article text becomes an articles row (plus analysis),
+        so articles retrieved by earlier jobs can be reused. The database file is
+        copied aside first, and the whole change runs in one transaction.
+        """
+        with self._connect() as conn:
+            columns = [r["name"] for r in conn.execute("PRAGMA table_info(job_articles)")]
+        if not columns or "article_id" in columns:
+            return
+        shutil.copy2(self.db_path, self.db_path.with_name(self.db_path.name + ".bak"))
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("BEGIN")
+            conn.execute("ALTER TABLE job_articles RENAME TO job_articles_old")
+            for statement in _SCHEMA_STATEMENTS:
+                conn.execute(statement)
+            old = conn.execute(
+                "SELECT o.*, j.params FROM job_articles_old o JOIN jobs j ON j.id = o.job_id "
+                "ORDER BY j.created_at, o.position"
+            ).fetchall()
+            for r in old:
+                article_id = None
+                if r["text"]:
+                    article_id = conn.execute(
+                        "INSERT INTO articles (url, url_key, title, source, published_at, "
+                        "published_at_source, retrieved_at, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (r["url"], normalize_url(r["url"]), r["title"], r["source"],
+                         r["published_at"], r["published_at_source"],
+                         r["retrieved_at"] or _now(), r["text"]),
+                    ).lastrowid
+                    ticker = (json.loads(r["params"]) or {}).get("ticker")
+                    if r["status"] in ("relevant", "done"):
+                        relevant = 1
+                    elif (r["reason"] or "").startswith("not primarily about"):
+                        relevant = 0
+                    else:
+                        relevant = None
+                    if ticker and (relevant is not None or r["summary"]):
+                        conn.execute(
+                            "INSERT OR IGNORE INTO article_analysis "
+                            "(article_id, ticker, relevant, summary) VALUES (?, ?, ?, ?)",
+                            (article_id, ticker, relevant, r["summary"]),
+                        )
+                conn.execute(
+                    "INSERT INTO job_articles (job_id, position, url, title, source, "
+                    "search_date, snippet, status, reason, article_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (r["job_id"], r["position"], r["url"], r["title"], r["source"],
+                     r["search_date"], r["snippet"], r["status"], r["reason"], article_id),
+                )
+            conn.execute("DROP TABLE job_articles_old")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
 
     def _recover(self) -> None:
         """After a restart: re-queue jobs that were mid-run or never started."""
@@ -266,11 +426,14 @@ class JobStore:
             return {"stage": "queued", "target": target, "total": 0, "counts": {}, "articles": []}
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT {_PROGRESS_COLUMNS} FROM job_articles "
-                "WHERE job_id=? ORDER BY position",
+                """SELECT j.url, COALESCE(a.title, j.title) AS title, j.source,
+                          j.status, j.reason, j.article_id, j.reused,
+                          a.published_at, a.retrieved_at
+                   FROM job_articles j LEFT JOIN articles a ON a.id = j.article_id
+                   WHERE j.job_id=? ORDER BY j.position""",
                 (job["id"],),
             ).fetchall()
-        articles = [dict(r) for r in rows]
+        articles = [_article_row(r) for r in rows]
         counts: dict[str, int] = {}
         for a in articles:
             counts[a["status"]] = counts.get(a["status"], 0) + 1

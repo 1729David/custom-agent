@@ -79,7 +79,7 @@ API_KEY=changeme uv run uvicorn server:get_app --factory --host 127.0.0.1 --port
 
 | Endpoint | Description |
 |----------|-------------|
-| `POST /news/{ticker}` | Queue a fetch-and-summarize job. Optional JSON body: `days` (default 30), `max_articles` (default 15). Returns `202` with the job; an identical queued/running job is reused (`200`) |
+| `POST /news/{ticker}` | Queue a fetch-and-summarize job. Optional JSON body: `days` (default 30), `max_articles` (default 15), `refresh` (default `false`; see below). Returns `202` with the job; an identical queued/running job is reused (`200`) |
 | `GET /jobs/{id}` | Job status (`queued`, `running`, `paused`, `done`, `failed`), a `progress` block, and, when done, the result |
 | `GET /jobs?status=&limit=` | Job history, newest first |
 | `POST /jobs/{id}/pause` | Pause a job. A queued job pauses at once; a running one at its next step (`stage` shows `pausing` meanwhile) |
@@ -88,9 +88,15 @@ API_KEY=changeme uv run uvicorn server:get_app --factory --host 127.0.0.1 --port
 
 Send the key as an `X-API-Key` header. If `API_KEY` is unset the API is unauthenticated (a warning is logged), so keep it bound to `127.0.0.1`.
 
-**How a job runs** (`news_pipeline.py`): list candidate articles from a news search, then for each one in turn fetch it (plain text only; no HTML or screenshots are kept), check it is primarily about the ticker, and summarize it; finally bundle the summaries into an overview. Each article's state is stored in the `job_articles` table (`pending` → `fetched` → `relevant` → `done`, or `skipped` with a `reason`). Jobs run one at a time, and a job interrupted by a restart is re-queued and resumes where it left off (paused jobs stay paused). Pause and cancel take effect between steps, so an article already being fetched or summarized finishes first. Pause/resume/cancel on a job in the wrong state returns `409`; a new request identical to a paused job returns that job.
+**How a job runs** (`news_pipeline.py`): list candidate articles from a news search (at most 2× `max_articles`), then for each one in turn fetch it (plain text only; no HTML or screenshots are kept), check it is primarily about the ticker, and summarize it; finally bundle the summaries into an overview. Each candidate's state is stored in `job_articles` (`pending` → `fetched` → `relevant` → `done`, or `skipped` with a `reason`). Jobs run one at a time, and a job interrupted by a restart is re-queued and resumes where it left off (paused jobs stay paused). Pause and cancel take effect between steps, so an article already being fetched or summarized finishes first. Pause/resume/cancel on a job in the wrong state returns `409`; a new request identical to a paused job returns that job.
 
-`progress` in `GET /jobs/{id}` has the current `stage` (`queued`, `listing`, `processing`, `bundling`, `pausing`, `cancelling`, `paused`, `done`, `failed`), the article `total`, per-status `counts`, and each article's `status` and `reason`.
+**Articles are shared across jobs.** Jobs and articles are many-to-many: `articles` holds each retrieval under its own `article_id` (URL, title, source, `published_at`, `retrieved_at`, plain text), `article_analysis` holds the per-ticker relevance verdict and summary, and `job_articles` links a job to the articles it considered. A job still searches for candidates every time, but a candidate whose URL (ignoring tracking parameters and fragments) was already retrieved is reused with its stored text, verdict and summary, so only new articles are downloaded and sent to the model. A reused article keeps its original `retrieved_at` and `article_id`, so the caller can recognize it. The `days` window is applied per job to the article's published date, so a stored article may be skipped by one job and used by another.
+
+With `"refresh": true` every candidate is downloaded again and stored as a new article entry (new `article_id`; earlier entries and earlier jobs' results are untouched). A later non-refresh job reuses the latest entry for each URL. Download failures are never stored, so they are retried next time.
+
+An older database is migrated automatically on startup (a `.bak` copy is written first).
+
+`progress` in `GET /jobs/{id}` has the current `stage` (`queued`, `listing`, `processing`, `bundling`, `pausing`, `cancelling`, `paused`, `done`, `failed`), the article `total`, per-status `counts`, and each article's `status`, `reason`, `article_id` and `reused`. `target` is the number of articles the job aims to keep (`max_articles`), while `total` is the larger candidate count.
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
@@ -100,7 +106,7 @@ Send the key as an `X-API-Key` header. If `API_KEY` is unset the API is unauthen
 | `NEWS_RELEVANCE_MODEL` | `NEWS_MODEL` | Model for the relevance check (a smaller one works) |
 | `NEWS_SUMMARY_MODEL` | `NEWS_MODEL` | Model for article summaries and the overview |
 
-A finished news job's `result` has `ticker`, `generated_at`, `overview`, and `articles` (each with `title`, `source`, `url`, `published_at`, `retrieved_at`, `summary`), plus `skipped`.
+A finished news job's `result` has `ticker`, `generated_at`, `overview`, and `articles` (each with `article_id`, `title`, `source`, `url`, `published_at`, `retrieved_at`, `summary`), plus `skipped`.
 
 ```bash
 curl -X POST -H "X-API-Key: changeme" localhost:8000/news/AAPL

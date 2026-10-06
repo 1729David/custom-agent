@@ -142,11 +142,12 @@ def list_articles(ticker: str, max_articles: int = 15) -> list[dict]:
 # --- Stage 2: fetch ----------------------------------------------------------
 
 
-def fetch_article(candidate: dict, cutoff: datetime) -> dict:
+def fetch_article(candidate: dict) -> dict:
     """Download one article and return its plain text and dates.
 
-    Raises ArticleSkipped if it can't be downloaded, is older than cutoff, or has
-    too little text.
+    Raises ArticleSkipped if it can't be downloaded. Whether the article is too
+    old or too short is judged separately (see _reject_reason) so that a stored
+    article can be re-judged by later jobs with different windows.
     """
     url = candidate["url"]
     try:
@@ -158,14 +159,10 @@ def fetch_article(candidate: dict, cutoff: datetime) -> dict:
     retrieved = _now()
     soup = BeautifulSoup(resp.text, "html.parser")
     published, pub_source = _extract_published(soup, candidate.get("search_date"))
-    if published and published < cutoff:
-        raise ArticleSkipped("older than window")
 
     text = _page_text(resp.text)
     if len(text) < _MIN_TEXT_CHARS:
         text = candidate.get("snippet") or text
-    if len(text) < _MIN_TEXT_CHARS:
-        raise ArticleSkipped("not enough article text")
 
     title = candidate.get("title") or (soup.title.string if soup.title else None)
     return {
@@ -220,7 +217,9 @@ def summarize_article(
 
 # --- Stage 5: bundle ---------------------------------------------------------
 
-_REPORT_FIELDS = ("title", "source", "url", "published_at", "retrieved_at", "summary")
+_REPORT_FIELDS = (
+    "article_id", "title", "source", "url", "published_at", "retrieved_at", "summary",
+)
 
 
 def build_report(ticker: str, articles: list[dict], model: str | None = None) -> dict:
@@ -249,14 +248,34 @@ def build_report(ticker: str, articles: list[dict], model: str | None = None) ->
 # --- Job driver --------------------------------------------------------------
 
 
-def run_news_job(ctx, ticker: str, days: int = 30, max_articles: int = 15) -> dict:
+def _reject_reason(art: dict, cutoff: datetime) -> str | None:
+    """Why a retrieved article can't be used by this job, or None if it can."""
+    published = _parse_date(art.get("published_at"))
+    if published and published < cutoff:
+        return "older than window"
+    if len(art.get("text") or "") < _MIN_TEXT_CHARS:
+        return "not enough article text"
+    return None
+
+
+def run_news_job(
+    ctx, ticker: str, days: int = 30, max_articles: int = 15, refresh: bool = False
+) -> dict:
     """Run the pipeline one article at a time, persisting state through ctx.
 
-    ctx provides articles(), add_articles(rows), update_article(url, **fields) and
-    checkpoint(), which raises to pause or cancel the job between steps.
-    Article status advances pending -> fetched -> relevant -> done (or skipped), so
-    calling this again on the same ctx resumes where the previous run stopped.
-    Raises LookupError if no usable articles were found.
+    ctx provides articles(), add_articles(rows), update_article(url, **fields),
+    cached_article(url), store_article(url, info), store_analysis(article_id, ...)
+    and checkpoint(), which raises to pause or cancel the job between steps.
+
+    Retrieved articles and their per-ticker analysis are shared across jobs: unless
+    refresh is true, a candidate that an earlier job already retrieved is reused
+    (its stored text, relevance verdict and summary), and only new articles are
+    downloaded and sent to the model. With refresh, every candidate is downloaded
+    again and stored as a new article.
+
+    Job-article status advances pending -> fetched -> relevant -> done (or
+    skipped), so calling this again on the same ctx resumes where the previous run
+    stopped. Raises LookupError if no usable articles were found.
     """
     ticker = ticker.strip().upper()
     cutoff = _now() - timedelta(days=int(days))
@@ -274,46 +293,66 @@ def run_news_job(ctx, ticker: str, days: int = 30, max_articles: int = 15) -> di
     for art in articles:
         url = art["url"]
 
-        def advance(**fields):
-            art.update(fields)
-            ctx.update_article(url, **fields)
+        def advance(status, reason=None, **job_fields):
+            art.update(status=status, reason=reason, **job_fields)
+            ctx.update_article(url, status=status, reason=reason, **job_fields)
 
         if art["status"] in ("done", "skipped"):
             continue
         if art["status"] in ("pending", "fetched") and kept >= int(max_articles):
-            advance(status="skipped", reason="max articles reached")
+            advance("skipped", "max articles reached")
             continue
 
         if art["status"] == "pending":
             ctx.checkpoint()
-            try:
-                info = fetch_article(art, cutoff)
-            except ArticleSkipped as e:
-                advance(status="skipped", reason=str(e))
+            found = None if refresh else ctx.cached_article(url)
+            if found:
+                found["reused"] = True
+            else:
+                try:
+                    info = fetch_article(art)
+                except ArticleSkipped as e:
+                    advance("skipped", str(e))
+                    continue
+                article_id = ctx.store_article(url, {**info, "source": art.get("source")})
+                found = {**info, "article_id": article_id, "relevant": None, "summary": None}
+                found["reused"] = False
+            art.update(found)
+            link = {"article_id": found["article_id"], "reused": found["reused"]}
+            reason = _reject_reason(art, cutoff)
+            if reason:
+                advance("skipped", reason, **link)
                 continue
-            advance(status="fetched", **info)
+            advance("fetched", **link)
 
         if art["status"] == "fetched":
             ctx.checkpoint()
-            if not check_relevance(ticker, art["title"], art["text"]):
-                advance(status="skipped", reason=f"not primarily about {ticker}")
+            if art.get("relevant") is None:
+                relevant = check_relevance(ticker, art["title"], art["text"])
+                ctx.store_analysis(art["article_id"], relevant=relevant)
+                art["relevant"] = relevant
+            if not art["relevant"]:
+                advance("skipped", f"not primarily about {ticker}")
                 continue
             kept += 1
-            advance(status="relevant")
+            advance("relevant")
 
         if art["status"] == "relevant":
             ctx.checkpoint()
-            summary = summarize_article(ticker, art["title"], art["text"])
-            advance(status="done", summary=summary)
+            if not art.get("summary"):
+                art["summary"] = summarize_article(ticker, art["title"], art["text"])
+                ctx.store_analysis(art["article_id"], summary=art["summary"])
+            advance("done")
 
     ctx.checkpoint()
-    done = [a for a in ctx.articles() if a["status"] == "done"]
+    final = ctx.articles()
+    done = [a for a in final if a["status"] == "done"]
     if not done:
         raise LookupError(f"No usable news found for {ticker}.")
     report = build_report(ticker, done)
     report["skipped"] = [
         {"url": a["url"], "title": a["title"], "reason": a["reason"]}
-        for a in ctx.articles()
+        for a in final
         if a["status"] == "skipped"
     ]
     return report

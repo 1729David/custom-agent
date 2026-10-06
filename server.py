@@ -21,10 +21,16 @@ JobStatus = Literal["queued", "running", "paused", "done", "failed"]
 
 class NewsRequest(BaseModel):
     days: int = Field(30, ge=1, le=90, description="Lookback window in days")
-    max_articles: int = Field(15, ge=1, le=30, description="Maximum articles to archive")
+    max_articles: int = Field(15, ge=1, le=30, description="Maximum articles to include")
+    refresh: bool = Field(
+        False,
+        description="Download every article again, as a new article entry, even if an "
+        "earlier job already retrieved it. Otherwise stored articles are reused.",
+    )
 
 
 class Article(BaseModel):
+    article_id: int
     title: str | None
     source: str | None
     url: str
@@ -52,6 +58,8 @@ class ArticleProgress(BaseModel):
     url: str
     title: str | None
     source: str | None
+    article_id: int | None = None
+    reused: bool = False
     status: Literal["pending", "fetched", "relevant", "done", "skipped"]
     reason: str | None
     published_at: str | None
