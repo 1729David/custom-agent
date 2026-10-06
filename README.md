@@ -54,6 +54,21 @@ Agent: ...
 | `calculate` | Evaluate math expressions (`sqrt`, `log`, etc.) |
 | `get_current_datetime` | Return the current date and time |
 
+## Stock news skill
+
+`/news <TICKER>` archives the past month of news for a stock and summarizes it. One-time setup for screenshots:
+
+```bash
+uv run playwright install chromium
+```
+
+| Tool | Description |
+|------|-------------|
+| `fetch_stock_news` | Find recent articles (DuckDuckGo news), save original HTML + screenshot + `meta.json` under `~/.custom-agent/news/<TICKER>/` |
+| `summarize_stock_news` | Per-article summaries (stored in `meta.json`) plus a combined dated overview |
+
+`meta.json` records both `retrieved_at` (when we downloaded it) and `published_at` (extracted from the page's metadata, falling back to the search result date; `published_at_source` says which).
+
 ## Changing the model
 
 Edit the `MODEL` constant at the top of `main.py`:
