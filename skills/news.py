@@ -13,8 +13,8 @@ from ddgs import DDGS
 NAME = "news"
 DESCRIPTION = "Archive the past month of news for a stock ticker, then summarize it"
 
-NEWS_MODEL = "qwen3.6:35b"
-NEWS_DIR = Path(os.path.expanduser("~/.custom-agent/news"))
+NEWS_MODEL = os.environ.get("NEWS_MODEL", "qwen3.6:35b")
+NEWS_DIR = Path(os.path.expanduser(os.environ.get("NEWS_DIR", "~/.custom-agent/news")))
 _HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; research-agent/1.0)"}
 _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _ARTICLE_TEXT_LIMIT = 8000
@@ -146,85 +146,99 @@ def _is_about_ticker(ticker: str, title: str, text: str, model: str) -> bool:
     return answer.upper().lstrip("*`\" ").startswith("YES")
 
 
+def fetch_news(ticker: str, days: int = 30, max_articles: int = 15) -> dict:
+    """Search for and archive recent articles. Returns {"ticker", "saved", "skipped"}.
+
+    Each saved entry carries an "id" (its archive folder name) so a later
+    summarize_news call can be scoped to exactly these articles.
+    """
+    ticker = ticker.strip().upper()
+    cutoff = _now() - timedelta(days=int(days))
+    found = _search(ticker, int(max_articles) * 2)
+    if not found:
+        return {"ticker": ticker, "saved": [], "skipped": []}
+
+    folder = NEWS_DIR / ticker
+    folder.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch()
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+    except Exception:
+        pw = browser = page = None
+
+    saved, skipped = [], []
+    try:
+        for r in found:
+            if len(saved) >= int(max_articles):
+                break
+            url = r["url"]
+            try:
+                resp = httpx.get(
+                    url, follow_redirects=True, timeout=15, headers=_HEADERS
+                )
+                resp.raise_for_status()
+            except Exception as e:
+                skipped.append({"url": url, "reason": f"download failed: {e}"})
+                continue
+
+            retrieved = _now()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            published, pub_source = _extract_published(soup, r.get("date"))
+            if published and published < cutoff:
+                skipped.append({"url": url, "reason": "older than window"})
+                continue
+
+            title = r.get("title") or (soup.title.string if soup.title else "")
+            text = _page_text(resp.text)
+            if len(text) < 200:
+                text = r.get("body") or text
+            if not _is_about_ticker(ticker, title, text, NEWS_MODEL):
+                skipped.append({"url": url, "title": title, "reason": f"not primarily about {ticker}"})
+                continue
+
+            slug = hashlib.sha1(url.encode()).hexdigest()[:10]
+            stamp = (published or retrieved).strftime("%Y%m%d")
+            art_dir = folder / f"{stamp}_{slug}"
+            art_dir.mkdir(exist_ok=True)
+            (art_dir / "article.html").write_bytes(resp.content)
+
+            shot_ok = page is not None and _screenshot(
+                page, url, art_dir / "screenshot.png"
+            )
+            meta = {
+                "url": url,
+                "title": title,
+                "source": r.get("source"),
+                "ticker": ticker,
+                "retrieved_at": retrieved.strftime(_TS_FORMAT),
+                "published_at": published.strftime(_TS_FORMAT) if published else None,
+                "published_at_source": pub_source,
+                "screenshot": "screenshot.png" if shot_ok else None,
+                "summary": None,
+            }
+            (art_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+            saved.append({**meta, "id": art_dir.name, "path": str(art_dir)})
+    finally:
+        if browser:
+            browser.close()
+        if pw:
+            pw.stop()
+
+    return {"ticker": ticker, "saved": saved, "skipped": skipped}
+
+
 def fetch_stock_news(ticker: str, days: int = 30, max_articles: int = 15) -> str:
     try:
-        ticker = ticker.strip().upper()
-        cutoff = _now() - timedelta(days=int(days))
-        found = _search(ticker, int(max_articles) * 2)
-        if not found:
-            return f"No news found for {ticker}."
-
-        folder = NEWS_DIR / ticker
-        folder.mkdir(parents=True, exist_ok=True)
-
-        try:
-            from playwright.sync_api import sync_playwright
-
-            pw = sync_playwright().start()
-            browser = pw.chromium.launch()
-            page = browser.new_page(viewport={"width": 1280, "height": 900})
-        except Exception:
-            pw = browser = page = None
-
-        saved, skipped = [], []
-        try:
-            for r in found:
-                if len(saved) >= int(max_articles):
-                    break
-                url = r["url"]
-                try:
-                    resp = httpx.get(
-                        url, follow_redirects=True, timeout=15, headers=_HEADERS
-                    )
-                    resp.raise_for_status()
-                except Exception as e:
-                    skipped.append({"url": url, "reason": f"download failed: {e}"})
-                    continue
-
-                retrieved = _now()
-                soup = BeautifulSoup(resp.text, "html.parser")
-                published, pub_source = _extract_published(soup, r.get("date"))
-                if published and published < cutoff:
-                    skipped.append({"url": url, "reason": "older than window"})
-                    continue
-
-                title = r.get("title") or (soup.title.string if soup.title else "")
-                text = _page_text(resp.text)
-                if len(text) < 200:
-                    text = r.get("body") or text
-                if not _is_about_ticker(ticker, title, text, NEWS_MODEL):
-                    skipped.append({"url": url, "title": title, "reason": f"not primarily about {ticker}"})
-                    continue
-
-                slug = hashlib.sha1(url.encode()).hexdigest()[:10]
-                stamp = (published or retrieved).strftime("%Y%m%d")
-                art_dir = folder / f"{stamp}_{slug}"
-                art_dir.mkdir(exist_ok=True)
-                (art_dir / "article.html").write_bytes(resp.content)
-
-                shot_ok = page is not None and _screenshot(
-                    page, url, art_dir / "screenshot.png"
-                )
-                meta = {
-                    "url": url,
-                    "title": title,
-                    "source": r.get("source"),
-                    "ticker": ticker,
-                    "retrieved_at": retrieved.strftime(_TS_FORMAT),
-                    "published_at": published.strftime(_TS_FORMAT) if published else None,
-                    "published_at_source": pub_source,
-                    "screenshot": "screenshot.png" if shot_ok else None,
-                    "summary": None,
-                }
-                (art_dir / "meta.json").write_text(json.dumps(meta, indent=2))
-                saved.append({**meta, "path": str(art_dir)})
-        finally:
-            if browser:
-                browser.close()
-            if pw:
-                pw.stop()
-
-        return json.dumps({"saved": saved, "skipped": skipped}, indent=2)
+        result = fetch_news(ticker, days, max_articles)
+        if not result["saved"] and not result["skipped"]:
+            return f"No news found for {result['ticker']}."
+        return json.dumps(
+            {"saved": result["saved"], "skipped": result["skipped"]}, indent=2
+        )
     except Exception as e:
         return f"Error: {e}"
 
@@ -234,60 +248,91 @@ def _chat(model: str, prompt: str) -> str:
     return resp["message"]["content"].strip()
 
 
+def summarize_news(
+    ticker: str, model: str | None = None, article_ids: list[str] | None = None
+) -> dict:
+    """Summarize archived articles. Raises LookupError if there are none.
+
+    article_ids restricts the summary to specific archive folders (the "id"
+    values returned by fetch_news); None means everything archived for the ticker.
+    """
+    ticker = ticker.strip().upper()
+    model = model or NEWS_MODEL
+    metas = sorted(
+        (
+            p
+            for p in (NEWS_DIR / ticker).glob("*/meta.json")
+            if article_ids is None or p.parent.name in article_ids
+        ),
+        key=lambda p: json.loads(p.read_text()).get("published_at") or "",
+    )
+    if not metas:
+        raise LookupError(f"No archived articles for {ticker}.")
+
+    entries = []
+    for path in metas:
+        meta = json.loads(path.read_text())
+        if not meta.get("summary"):
+            text = _page_text((path.parent / "article.html").read_text(errors="replace"))
+            if len(text) < 200:
+                meta["summary"] = "(not enough article text to summarize)"
+            else:
+                meta["summary"] = _chat(
+                    model,
+                    f"Summarize this news article about {ticker} in 3-4 sentences. "
+                    "Focus on facts relevant to the stock (results, guidance, "
+                    "products, analyst actions, risks). No preamble.\n\n"
+                    f"Title: {meta['title']}\n\n{text[:_ARTICLE_TEXT_LIMIT]}",
+                )
+            path.write_text(json.dumps(meta, indent=2))
+        entries.append(meta)
+
+    digest = "\n\n".join(
+        f"[{m['published_at'] or 'date unknown'}] {m['title']} ({m['source']})\n{m['summary']}"
+        for m in entries
+    )
+    overview = _chat(
+        model,
+        f"Below are per-article summaries of the past month of news on {ticker}, "
+        "oldest first. Write a concise overview: key themes, notable events "
+        "with their dates, and overall tone. Only use facts from the summaries.\n\n"
+        + digest,
+    )
+    return {
+        "ticker": ticker,
+        "generated_at": _now().strftime(_TS_FORMAT),
+        "article_count": len(entries),
+        "overview": overview,
+        "articles": [
+            {k: m[k] for k in ("title", "source", "url", "published_at", "retrieved_at", "summary")}
+            for m in entries
+        ],
+    }
+
+
 def summarize_stock_news(ticker: str, model: str | None = None) -> str:
     try:
-        ticker = ticker.strip().upper()
-        model = model or NEWS_MODEL
-        metas = sorted(
-            (NEWS_DIR / ticker).glob("*/meta.json"),
-            key=lambda p: json.loads(p.read_text()).get("published_at") or "",
-        )
-        if not metas:
-            return f"No archived articles for {ticker}. Run fetch_stock_news first."
-
-        entries = []
-        for path in metas:
-            meta = json.loads(path.read_text())
-            if not meta.get("summary"):
-                text = _page_text((path.parent / "article.html").read_text(errors="replace"))
-                if len(text) < 200:
-                    meta["summary"] = "(not enough article text to summarize)"
-                else:
-                    meta["summary"] = _chat(
-                        model,
-                        f"Summarize this news article about {ticker} in 3-4 sentences. "
-                        "Focus on facts relevant to the stock (results, guidance, "
-                        "products, analyst actions, risks). No preamble.\n\n"
-                        f"Title: {meta['title']}\n\n{text[:_ARTICLE_TEXT_LIMIT]}",
-                    )
-                path.write_text(json.dumps(meta, indent=2))
-            entries.append(meta)
-
-        digest = "\n\n".join(
-            f"[{m['published_at'] or 'date unknown'}] {m['title']} ({m['source']})\n{m['summary']}"
-            for m in entries
-        )
-        overview = _chat(
-            model,
-            f"Below are per-article summaries of the past month of news on {ticker}, "
-            "oldest first. Write a concise overview: key themes, notable events "
-            "with their dates, and overall tone. Only use facts from the summaries.\n\n"
-            + digest,
-        )
-        return json.dumps(
-            {
-                "ticker": ticker,
-                "article_count": len(entries),
-                "overview": overview,
-                "articles": [
-                    {k: m[k] for k in ("title", "source", "url", "published_at", "retrieved_at", "summary")}
-                    for m in entries
-                ],
-            },
-            indent=2,
-        )
+        return json.dumps(summarize_news(ticker, model), indent=2)
+    except LookupError:
+        return f"No archived articles for {ticker.strip().upper()}. Run fetch_stock_news first."
     except Exception as e:
         return f"Error: {e}"
+
+
+def get_news_report(
+    ticker: str, days: int = 30, max_articles: int = 15, model: str | None = None
+) -> dict:
+    """Fetch and summarize in one step, scoped to the articles from this fetch.
+
+    Raises LookupError if no usable articles were found.
+    """
+    fetched = fetch_news(ticker, days, max_articles)
+    ids = [a["id"] for a in fetched["saved"]]
+    if not ids:
+        raise LookupError(f"No usable news found for {fetched['ticker']}.")
+    report = summarize_news(ticker, model, article_ids=ids)
+    report["skipped"] = fetched["skipped"]
+    return report
 
 
 TOOL_FUNCTIONS = {
