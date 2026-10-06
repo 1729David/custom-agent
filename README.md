@@ -69,6 +69,29 @@ uv run playwright install chromium
 
 `meta.json` records both `retrieved_at` (when we downloaded it) and `published_at` (extracted from the page's metadata, falling back to the search result date; `published_at_source` says which).
 
+## REST API
+
+A restricted HTTP API exposes selected skills as background jobs, for another app on the same machine to call. It does not expose the chat agent. The caller stores the results; the server keeps a SQLite history of every job (`~/.custom-agent/jobs.db`, override with `JOBS_DB`).
+
+```bash
+API_KEY=changeme uv run uvicorn server:get_app --factory --host 127.0.0.1 --port 8000
+```
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /news/{ticker}` | Queue a fetch-and-summarize job. Optional JSON body: `days` (default 30), `max_articles` (default 15). Returns `202` with the job; an identical queued/running job is reused (`200`) |
+| `GET /jobs/{id}` | Job status (`queued`, `running`, `done`, `failed`) and, when done, the result |
+| `GET /jobs?status=&limit=` | Job history, newest first |
+
+Send the key as an `X-API-Key` header. If `API_KEY` is unset the API is unauthenticated (a warning is logged), so keep it bound to `127.0.0.1`. Jobs run one at a time. A job interrupted by a restart is marked `failed`.
+
+A finished news job's `result` has `ticker`, `generated_at`, `overview`, and `articles` (each with `title`, `source`, `url`, `published_at`, `retrieved_at`, `summary`), plus `skipped`.
+
+```bash
+curl -X POST -H "X-API-Key: changeme" localhost:8000/news/AAPL
+curl -H "X-API-Key: changeme" localhost:8000/jobs/<id>
+```
+
 ## Changing the model
 
 Edit the `MODEL` constant at the top of `main.py`:
