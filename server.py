@@ -63,6 +63,7 @@ class Progress(BaseModel):
         "queued", "listing", "processing", "bundling",
         "pausing", "cancelling", "paused", "done", "failed",
     ]
+    target: int | None = None
     total: int
     counts: dict[str, int]
     articles: list[ArticleProgress]

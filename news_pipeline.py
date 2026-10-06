@@ -124,8 +124,9 @@ def _chat(model: str, prompt: str) -> str:
 def list_articles(ticker: str, max_articles: int = 15) -> list[dict]:
     """Candidate articles from a news search: url, title, source, search_date, snippet.
 
-    Returns up to twice max_articles, since some will fail later stages.
+    Returns at most twice max_articles, since some will fail later stages.
     """
+    limit = int(max_articles) * 2
     return [
         {
             "url": r["url"],
@@ -134,7 +135,7 @@ def list_articles(ticker: str, max_articles: int = 15) -> list[dict]:
             "search_date": r.get("date"),
             "snippet": r.get("body"),
         }
-        for r in _search(ticker.strip().upper(), int(max_articles) * 2)
+        for r in _search(ticker.strip().upper(), limit)[:limit]
     ]
 
 

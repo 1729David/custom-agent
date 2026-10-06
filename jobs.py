@@ -256,9 +256,14 @@ class JobStore:
         return job
 
     def progress(self, job: dict) -> dict | None:
-        """Stage, per-status article counts and per-article state for a job."""
+        """Stage, per-status article counts and per-article state for a job.
+
+        target is how many articles the job aims to keep (its max_articles); total
+        is the candidate count, which is larger because some candidates are rejected.
+        """
+        target = (job["params"] or {}).get("max_articles")
         if job["status"] == "queued":
-            return {"stage": "queued", "total": 0, "counts": {}, "articles": []}
+            return {"stage": "queued", "target": target, "total": 0, "counts": {}, "articles": []}
         with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT {_PROGRESS_COLUMNS} FROM job_articles "
@@ -280,7 +285,13 @@ class JobStore:
             stage = "processing"
         else:
             stage = "bundling"
-        return {"stage": stage, "total": len(articles), "counts": counts, "articles": articles}
+        return {
+            "stage": stage,
+            "target": target,
+            "total": len(articles),
+            "counts": counts,
+            "articles": articles,
+        }
 
     def list(self, limit: int = 50, status: str | None = None) -> list[dict]:
         sql, args = "SELECT * FROM jobs", []
