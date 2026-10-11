@@ -113,9 +113,10 @@ def normalize_url(url: str) -> str:
 class JobInterrupted(Exception):
     """Raised by JobContext.checkpoint() when the job was asked to pause or cancel."""
 
-    def __init__(self, action: str):
+    def __init__(self, action: str, message: str | None = None):
         super().__init__(action)
         self.action = action  # "pause" or "cancel"
+        self.message = message  # stored as the job's error when it pauses
 
 
 class InvalidTransition(ValueError):
@@ -140,6 +141,10 @@ class JobContext:
         action = self._store._control.get(self.job_id)
         if action:
             raise JobInterrupted(action)
+
+    def pause_job(self, message: str) -> None:
+        """Stop the job in the paused state, recording why; resume continues it."""
+        raise JobInterrupted("pause", message)
 
     def articles(self) -> list[dict]:
         with self._store._connect() as conn:
@@ -484,7 +489,7 @@ class JobStore:
                 status, result_json, error = "done", json.dumps(result), None
             except JobInterrupted as e:
                 if e.action == "pause":
-                    status, result_json, error = "paused", None, None
+                    status, result_json, error = "paused", None, e.message
                 else:
                     status, result_json, error = "failed", None, "cancelled by user"
             except Exception as e:

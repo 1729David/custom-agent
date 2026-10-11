@@ -94,6 +94,8 @@ Send the key as an `X-API-Key` header. If `API_KEY` is unset the API is unauthen
 
 With `"refresh": true` every candidate is downloaded again and stored as a new article entry (new `article_id`; earlier entries and earlier jobs' results are untouched). A later non-refresh job reuses the latest entry for each URL. Download failures are never stored, so they are retried next time.
 
+**Ollama failures.** A dropped connection, timeout or 5xx from Ollama is retried after 5, 20 and 60 seconds. If it is still failing, the job is **paused** (not failed) with an `error` explaining why; all progress is already saved, so `POST /jobs/{id}/resume` continues it once Ollama is back. Other errors, such as an unknown model, fail the job. In jobs, a relevance check never guesses when Ollama is down, so no unverified verdict is ever stored.
+
 An older database is migrated automatically on startup (a `.bak` copy is written first).
 
 `progress` in `GET /jobs/{id}` has the current `stage` (`queued`, `listing`, `processing`, `bundling`, `pausing`, `cancelling`, `paused`, `done`, `failed`), the article `total`, per-status `counts`, and each article's `status`, `reason`, `article_id` and `reused`. `target` is the number of articles the job aims to keep (`max_articles`), while `total` is the larger candidate count.
@@ -105,6 +107,7 @@ An older database is migrated automatically on startup (a `.bak` copy is written
 | `NEWS_MODEL` | `qwen3.6:35b` | Ollama model for everything below |
 | `NEWS_RELEVANCE_MODEL` | `NEWS_MODEL` | Model for the relevance check (a smaller one works) |
 | `NEWS_SUMMARY_MODEL` | `NEWS_MODEL` | Model for article summaries and the overview |
+| `NEWS_LLM_TIMEOUT` | `300` | Seconds to wait for one Ollama response |
 
 A finished news job's `result` has `ticker`, `generated_at`, `overview`, and `articles` (each with `article_id`, `title`, `source`, `url`, `published_at`, `retrieved_at`, `summary`), plus `skipped`.
 

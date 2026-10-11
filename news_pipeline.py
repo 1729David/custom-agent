@@ -8,6 +8,7 @@ context, which persists each article's state so an interrupted job can resume.
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -24,9 +25,24 @@ _TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 _ARTICLE_TEXT_LIMIT = 8000
 _MIN_TEXT_CHARS = 200
 
+# Ollama calls are retried on transient failures (dropped connection, timeout, 5xx)
+# after these delays in seconds; once they run out the job pauses so it can be resumed.
+_LLM_TIMEOUT = float(os.environ.get("NEWS_LLM_TIMEOUT", "300"))
+_LLM_RETRY_DELAYS = (5, 20, 60)
+
 
 class ArticleSkipped(Exception):
     """An article was rejected for an expected reason (carried as the message)."""
+
+
+class LLMUnavailable(Exception):
+    """Ollama kept failing with transient errors after all retries."""
+
+
+def _is_transient(error: Exception) -> bool:
+    if isinstance(error, ollama.ResponseError):
+        return error.status_code >= 500
+    return isinstance(error, (httpx.TransportError, ConnectionError, TimeoutError))
 
 
 def _now() -> datetime:
@@ -114,8 +130,25 @@ def _search(ticker: str, max_results: int) -> list[dict]:
 
 
 def _chat(model: str, prompt: str) -> str:
-    resp = ollama.chat(model=model, messages=[{"role": "user", "content": prompt}])
-    return resp["message"]["content"].strip()
+    """One Ollama chat call, retrying transient failures.
+
+    Raises LLMUnavailable once the retries are used up; other errors (such as an
+    unknown model) are not retried and propagate unchanged.
+    """
+    delays = iter(_LLM_RETRY_DELAYS)
+    while True:
+        try:
+            resp = ollama.Client(timeout=_LLM_TIMEOUT).chat(
+                model=model, messages=[{"role": "user", "content": prompt}]
+            )
+            return resp["message"]["content"].strip()
+        except Exception as e:
+            if not _is_transient(e):
+                raise
+            delay = next(delays, None)
+            if delay is None:
+                raise LLMUnavailable(f"{type(e).__name__}: {e}") from e
+            time.sleep(delay)
 
 
 # --- Stage 1: list -----------------------------------------------------------
@@ -178,12 +211,17 @@ def fetch_article(candidate: dict) -> dict:
 
 
 def check_relevance(
-    ticker: str, title: str | None, text: str, model: str | None = None
+    ticker: str,
+    title: str | None,
+    text: str,
+    model: str | None = None,
+    fail_open: bool = True,
 ) -> bool:
     """Ask the model whether the article is primarily about the ticker's company.
 
-    Fails open (returns True) if the model can't be reached, so an Ollama outage
-    doesn't silently discard every article.
+    If the model can't be reached this returns True (fail open) so an outage doesn't
+    silently discard every article, unless fail_open is false, in which case the
+    error propagates; jobs that store the verdict must not record a guess.
     """
     prompt = (
         f"Stock ticker: {ticker}\n\n"
@@ -196,6 +234,8 @@ def check_relevance(
     try:
         answer = _chat(model or RELEVANCE_MODEL, prompt)
     except Exception:
+        if not fail_open:
+            raise
         return True
     return answer.upper().lstrip("*`\" ").startswith("YES")
 
@@ -258,14 +298,28 @@ def _reject_reason(art: dict, cutoff: datetime) -> str | None:
     return None
 
 
-def run_news_job(
+def run_news_job(ctx, *args, **kwargs) -> dict:
+    """Run the news pipeline; pause the job if Ollama stays unavailable.
+
+    See _run_news_job. When Ollama keeps failing past the retries, all progress is
+    already stored per article, so the job is paused (resume it once Ollama is back)
+    and not failed.
+    """
+    try:
+        return _run_news_job(ctx, *args, **kwargs)
+    except LLMUnavailable as e:
+        ctx.pause_job(f"Ollama unavailable, job paused; resume it once Ollama is back ({e})")
+
+
+def _run_news_job(
     ctx, ticker: str, days: int = 30, max_articles: int = 15, refresh: bool = False
 ) -> dict:
     """Run the pipeline one article at a time, persisting state through ctx.
 
     ctx provides articles(), add_articles(rows), update_article(url, **fields),
-    cached_article(url), store_article(url, info), store_analysis(article_id, ...)
-    and checkpoint(), which raises to pause or cancel the job between steps.
+    cached_article(url), store_article(url, info), store_analysis(article_id, ...),
+    checkpoint(), which raises to pause or cancel the job between steps, and
+    pause_job(message), which pauses it with an explanation.
 
     Retrieved articles and their per-ticker analysis are shared across jobs: unless
     refresh is true, a candidate that an earlier job already retrieved is reused
@@ -328,7 +382,9 @@ def run_news_job(
         if art["status"] == "fetched":
             ctx.checkpoint()
             if art.get("relevant") is None:
-                relevant = check_relevance(ticker, art["title"], art["text"])
+                relevant = check_relevance(
+                    ticker, art["title"], art["text"], fail_open=False
+                )
                 ctx.store_analysis(art["article_id"], relevant=relevant)
                 art["relevant"] = relevant
             if not art["relevant"]:
