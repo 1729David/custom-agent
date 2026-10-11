@@ -31,7 +31,31 @@ _MIN_TEXT_CHARS = 200
 # share of the shorter one's 5-word phrases that appear in the other ("containment").
 # Calibrated on real articles: a true copy scored 1.00, while two different stories
 # from one outlet sharing site boilerplate scored 0.52 and everything else <= 0.45.
-_RELEVANCE_MAX_TOKENS = 16  # the reply is one word; leave room for markdown around it
+# The relevance reply is a short subject line plus YES/NO. Temperature 0 keeps the
+# verdict repeatable, since it is stored and reused by later jobs.
+_RELEVANCE_MAX_TOKENS = 60
+_RELEVANCE_TEMPERATURE = 0
+_RELEVANCE_ANSWER = re.compile(r"ANSWER:\s*[*`\"' ]*(YES|NO)", re.IGNORECASE)
+
+# Naming the main subject before answering is what separates a real article about the
+# company from a market wrap or a list that merely includes it. Measured on 25 labeled
+# negatives and 44 positives: the one-word prompt let two roundups through (92%
+# specificity), this one let none through, at the same speed.
+_RELEVANCE_PROMPT = """\
+You are screening news for a sentiment feed about the company with stock ticker {ticker}. Decide whether this article is primarily about that company, meaning the company (its business, products, executives, stock, earnings, legal matters or analyst views) is the main subject.
+Answer NO if any of these apply:
+- the article is mainly about another company or topic, and {ticker} is only a comparison, example, supplier, customer or background;
+- it is a market wrap, premarket or futures roundup, or a list of several stocks, where {ticker} is one of many;
+- {ticker} appears only in the title or a ticker list while the body is about something else.
+Answer YES only if you could summarize the article as being about {ticker}'s company.
+
+Title: {title}
+
+{text}
+
+Reply in exactly this format:
+MAIN SUBJECT: <the one company or topic the article is mainly about, or 'several companies'>
+ANSWER: YES or NO"""
 
 _DUP_SHINGLE_WORDS = 5
 _DUP_MAX_WORDS = 3000
@@ -145,15 +169,27 @@ def _search(ticker: str, max_results: int) -> list[dict]:
     return list(seen.values())
 
 
-def _chat(model: str, prompt: str, max_tokens: int | None = None) -> str:
+def _chat(
+    model: str,
+    prompt: str,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+) -> str:
     """One Ollama chat call, retrying transient failures.
 
-    max_tokens caps the reply length; it is ignored when thinking is enabled, since
-    the reasoning tokens would use the budget up before any answer. Raises
-    LLMUnavailable once the retries are used up; other errors (such as an unknown
-    model) are not retried and propagate unchanged.
+    max_tokens caps the reply length and temperature fixes the sampling; both are
+    ignored when thinking is enabled, since the reasoning tokens would use the budget
+    up before any answer and greedy decoding is discouraged for thinking models.
+    Raises LLMUnavailable once the retries are used up; other errors (such as an
+    unknown model) are not retried and propagate unchanged.
     """
-    options = {"num_predict": max_tokens} if max_tokens and not _LLM_THINK else None
+    options = {}
+    if not _LLM_THINK:
+        if max_tokens:
+            options["num_predict"] = max_tokens
+        if temperature is not None:
+            options["temperature"] = temperature
+    options = options or None
     delays = iter(_LLM_RETRY_DELAYS)
     while True:
         try:
@@ -288,20 +324,26 @@ def check_relevance(
     silently discard every article, unless fail_open is false, in which case the
     error propagates; jobs that store the verdict must not record a guess.
     """
-    prompt = (
-        f"Stock ticker: {ticker}\n\n"
-        f"Title: {title}\n\n{text[:3000]}\n\n"
-        f"Is this article primarily about the company with ticker {ticker}? "
-        "Answer NO if it is mainly about a different company, or only mentions "
-        f"{ticker} in passing (e.g. in a list of stocks or a comparison). "
-        "Reply with exactly one word: YES or NO."
-    )
+    prompt = _RELEVANCE_PROMPT.format(ticker=ticker, title=title, text=text[:3000])
     try:
-        answer = _chat(model or RELEVANCE_MODEL, prompt, max_tokens=_RELEVANCE_MAX_TOKENS)
+        answer = _chat(
+            model or RELEVANCE_MODEL,
+            prompt,
+            max_tokens=_RELEVANCE_MAX_TOKENS,
+            temperature=_RELEVANCE_TEMPERATURE,
+        )
     except Exception:
         if not fail_open:
             raise
         return True
+    return _parse_relevance(answer)
+
+
+def _parse_relevance(answer: str) -> bool:
+    """YES/NO from a reply in the requested format, or a bare YES/NO as a fallback."""
+    match = _RELEVANCE_ANSWER.search(answer)
+    if match:
+        return match.group(1).upper() == "YES"
     return answer.upper().lstrip("*`\" ").startswith("YES")
 
 
