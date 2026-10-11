@@ -96,6 +96,8 @@ Send the key as an `X-API-Key` header. If `API_KEY` is unset the API is unauthen
 
 With `"refresh": true` every candidate is downloaded again and stored as a new article entry (new `article_id`; earlier entries and earlier jobs' results are untouched). A later non-refresh job reuses the latest entry for each URL. Download failures are never stored, so they are retried next time.
 
+**Speed and model choice.** Qwen3-family models "think" before answering unless told not to, which generates thousands of hidden tokens; the pipeline turns thinking off (`NEWS_LLM_THINK=1` re-enables it). That alone cut a 15-article AAPL job from about 15 minutes to under 3, with summaries of the same length and no unsupported figures. Smaller models did not help in a benchmark on stored articles (thinking off, per article for relevance plus summary): `qwen3.6:35b` took 8.2s because it is a mixture-of-experts model, `qwen3.5:latest` (9.7B, dense) took 14.6s and was less accurate (it accepted an off-topic article and invented a figure), and using the small model for relevance and the large one for summaries took 21.4s because the two do not fit in memory together and reload every article. Keep one model for both steps.
+
 **Ollama failures.** A dropped connection, timeout or 5xx from Ollama is retried after 5, 20 and 60 seconds. If it is still failing, the job is **paused** (not failed) with an `error` explaining why; all progress is already saved, so `POST /jobs/{id}/resume` continues it once Ollama is back. Other errors, such as an unknown model, fail the job. In jobs, a relevance check never guesses when Ollama is down, so no unverified verdict is ever stored.
 
 An older database is migrated automatically on startup (a `.bak` copy is written first).
@@ -110,6 +112,7 @@ An older database is migrated automatically on startup (a `.bak` copy is written
 | `NEWS_RELEVANCE_MODEL` | `NEWS_MODEL` | Model for the relevance check (a smaller one works) |
 | `NEWS_SUMMARY_MODEL` | `NEWS_MODEL` | Model for article summaries and the overview |
 | `NEWS_LLM_TIMEOUT` | `300` | Seconds to wait for one Ollama response |
+| `NEWS_LLM_THINK` | off | Set to `1` to enable the model's thinking mode (see below) |
 
 A finished news job's `result` has `ticker`, `generated_at`, `overview`, and `articles` (each with `article_id`, `title`, `source`, `url`, `published_at`, `retrieved_at`, `summary`), plus `skipped`.
 

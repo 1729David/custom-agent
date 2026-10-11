@@ -10,11 +10,13 @@ class FakeClient:
 
     script: list = []
     timeouts: list = []
+    requests: list = []
 
     def __init__(self, timeout=None):
         FakeClient.timeouts.append(timeout)
 
-    def chat(self, model, messages):
+    def chat(self, model, messages, think=None, options=None):
+        FakeClient.requests.append({"model": model, "think": think, "options": options})
         step = FakeClient.script.pop(0)
         if isinstance(step, Exception):
             raise step
@@ -23,7 +25,7 @@ class FakeClient:
 
 @pytest.fixture(autouse=True)
 def fake_ollama(monkeypatch, sleeps):
-    FakeClient.script, FakeClient.timeouts = [], []
+    FakeClient.script, FakeClient.timeouts, FakeClient.requests = [], [], []
     monkeypatch.setattr(np.ollama, "Client", FakeClient)
     return FakeClient
 
@@ -111,7 +113,7 @@ def test_relevance_can_fail_closed_to_avoid_guessing(fake_ollama):
 
 def test_models_are_configurable(monkeypatch):
     used = []
-    monkeypatch.setattr(np, "_chat", lambda model, prompt: used.append(model) or "YES")
+    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: used.append(model) or "YES")
     monkeypatch.setattr(np, "RELEVANCE_MODEL", "small-model")
     monkeypatch.setattr(np, "SUMMARY_MODEL", "big-model")
     np.check_relevance("AAPL", "t", "text")
@@ -125,14 +127,14 @@ def test_models_are_configurable(monkeypatch):
 
 def test_prompts_carry_the_ticker_and_truncate_long_text(monkeypatch):
     prompts = []
-    monkeypatch.setattr(np, "_chat", lambda model, prompt: prompts.append(prompt) or "ok")
+    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: prompts.append(prompt) or "ok")
     np.summarize_article("AAPL", "A title", "x" * 20000)
     assert "AAPL" in prompts[0] and "A title" in prompts[0]
     assert prompts[0].count("x") == np._ARTICLE_TEXT_LIMIT
 
 
 def test_report_is_ordered_oldest_first_with_undated_first(monkeypatch):
-    monkeypatch.setattr(np, "_chat", lambda model, prompt: "OVERVIEW")
+    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: "OVERVIEW")
 
     def art(i, published):
         return {"article_id": i, "title": f"t{i}", "source": "s", "url": f"u{i}",
@@ -144,3 +146,38 @@ def test_report_is_ordered_oldest_first_with_undated_first(monkeypatch):
     assert [a["article_id"] for a in report["articles"]] == [2, 3, 1]
     assert report["article_count"] == 3 and report["overview"] == "OVERVIEW"
     assert report["generated_at"].endswith("Z")
+
+
+# --- thinking mode -----------------------------------------------------------
+
+
+def test_thinking_is_off_by_default(fake_ollama):
+    fake_ollama.script = ["ok"]
+    np._chat("m", "p")
+    assert fake_ollama.requests == [{"model": "m", "think": False, "options": None}]
+
+
+def test_reply_length_is_capped_only_when_thinking_is_off(fake_ollama, monkeypatch):
+    fake_ollama.script = ["ok", "ok"]
+    np._chat("m", "p", max_tokens=16)
+    assert fake_ollama.requests[-1]["options"] == {"num_predict": 16}
+
+    monkeypatch.setattr(np, "_LLM_THINK", True)  # reasoning would eat the budget
+    np._chat("m", "p", max_tokens=16)
+    assert fake_ollama.requests[-1] == {"model": "m", "think": True, "options": None}
+
+
+def test_relevance_check_asks_for_a_short_reply(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: seen.update(kw) or "YES")
+    np.check_relevance("AAPL", "t", "text")
+    assert seen == {"max_tokens": np._RELEVANCE_MAX_TOKENS}
+
+
+def test_thinking_can_be_enabled_from_the_environment(monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("NEWS_LLM_THINK", "1")
+    assert importlib.reload(np)._LLM_THINK is True
+    monkeypatch.delenv("NEWS_LLM_THINK")
+    assert importlib.reload(np)._LLM_THINK is False
