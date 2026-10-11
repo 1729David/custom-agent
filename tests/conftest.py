@@ -104,7 +104,7 @@ def world(monkeypatch):
     monkeypatch.setattr(np, "fetch_article", w.fetch_article)
     monkeypatch.setattr(np, "check_relevance", w.check_relevance)
     monkeypatch.setattr(np, "summarize_article", w.summarize_article)
-    monkeypatch.setattr(np, "_chat", lambda model, prompt: "OVERVIEW")
+    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: "OVERVIEW")
     return w
 
 

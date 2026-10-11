@@ -31,6 +31,8 @@ _MIN_TEXT_CHARS = 200
 # share of the shorter one's 5-word phrases that appear in the other ("containment").
 # Calibrated on real articles: a true copy scored 1.00, while two different stories
 # from one outlet sharing site boilerplate scored 0.52 and everything else <= 0.45.
+_RELEVANCE_MAX_TOKENS = 16  # the reply is one word; leave room for markdown around it
+
 _DUP_SHINGLE_WORDS = 5
 _DUP_MAX_WORDS = 3000
 _DUP_MIN_SHINGLES = 15  # shorter texts are too small to compare
@@ -38,6 +40,10 @@ _DUP_CONTAINMENT = 0.70
 _DUP_CONTAINMENT_SAME_TITLE = 0.25  # lower bar when the titles also match
 
 _LLM_TIMEOUT = float(os.environ.get("NEWS_LLM_TIMEOUT", "300"))
+# Qwen3-family models "think" by default: thousands of hidden reasoning tokens before
+# each answer. Off, a summary takes ~6s instead of ~57s and the summaries are just as
+# good (measured on stored articles). Set NEWS_LLM_THINK=1 to turn it back on.
+_LLM_THINK = os.environ.get("NEWS_LLM_THINK", "0").lower() in ("1", "true", "yes")
 _LLM_RETRY_DELAYS = (5, 20, 60)
 
 
@@ -139,17 +145,23 @@ def _search(ticker: str, max_results: int) -> list[dict]:
     return list(seen.values())
 
 
-def _chat(model: str, prompt: str) -> str:
+def _chat(model: str, prompt: str, max_tokens: int | None = None) -> str:
     """One Ollama chat call, retrying transient failures.
 
-    Raises LLMUnavailable once the retries are used up; other errors (such as an
-    unknown model) are not retried and propagate unchanged.
+    max_tokens caps the reply length; it is ignored when thinking is enabled, since
+    the reasoning tokens would use the budget up before any answer. Raises
+    LLMUnavailable once the retries are used up; other errors (such as an unknown
+    model) are not retried and propagate unchanged.
     """
+    options = {"num_predict": max_tokens} if max_tokens and not _LLM_THINK else None
     delays = iter(_LLM_RETRY_DELAYS)
     while True:
         try:
             resp = ollama.Client(timeout=_LLM_TIMEOUT).chat(
-                model=model, messages=[{"role": "user", "content": prompt}]
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                think=_LLM_THINK,
+                options=options,
             )
             return resp["message"]["content"].strip()
         except Exception as e:
@@ -285,7 +297,7 @@ def check_relevance(
         "Reply with exactly one word: YES or NO."
     )
     try:
-        answer = _chat(model or RELEVANCE_MODEL, prompt)
+        answer = _chat(model or RELEVANCE_MODEL, prompt, max_tokens=_RELEVANCE_MAX_TOKENS)
     except Exception:
         if not fail_open:
             raise
