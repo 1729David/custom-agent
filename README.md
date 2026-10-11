@@ -116,6 +116,14 @@ curl -X POST -H "X-API-Key: changeme" localhost:8000/news/AAPL
 curl -H "X-API-Key: changeme" localhost:8000/jobs/<id>
 ```
 
+## Tests
+
+```bash
+uv run pytest
+```
+
+The suite covers the REST API, job store, article cache, migration, news pipeline and the `/news` skill. It runs in about two seconds and makes no network calls: Ollama, web search and page downloads are stubbed, and every test uses a temporary database (it never touches `~/.custom-agent/`). It doesn't cover the older tools, the research skill or the SEC 10-K skill.
+
 ## Changing the model
 
 Edit the `MODEL` constant at the top of `main.py`:
