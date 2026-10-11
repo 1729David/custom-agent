@@ -69,6 +69,63 @@ uv run playwright install chromium
 
 `meta.json` records both `retrieved_at` (when we downloaded it) and `published_at` (extracted from the page's metadata, falling back to the search result date; `published_at_source` says which).
 
+## REST API
+
+A restricted HTTP API exposes selected skills as background jobs, for another app on the same machine to call. It does not expose the chat agent. The caller stores the results; the server keeps a SQLite history of every job (`~/.custom-agent/jobs.db`, override with `JOBS_DB`).
+
+```bash
+API_KEY=changeme uv run uvicorn server:get_app --factory --host 127.0.0.1 --port 8000
+```
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /news/{ticker}` | Queue a fetch-and-summarize job. Optional JSON body: `days` (default 30), `max_articles` (default 15), `refresh` (default `false`; see below). Returns `202` with the job; an identical queued/running job is reused (`200`) |
+| `GET /jobs/{id}` | Job status (`queued`, `running`, `paused`, `done`, `failed`), a `progress` block, and, when done, the result |
+| `GET /jobs?status=&limit=` | Job history, newest first |
+| `POST /jobs/{id}/pause` | Pause a job. A queued job pauses at once; a running one at its next step (`stage` shows `pausing` meanwhile) |
+| `POST /jobs/{id}/resume` | Re-queue a paused job; it continues where it left off |
+| `POST /jobs/{id}/cancel` | Fail a job with error `cancelled by user` (a running job at its next step, `stage` `cancelling`) |
+
+Send the key as an `X-API-Key` header. If `API_KEY` is unset the API is unauthenticated (a warning is logged), so keep it bound to `127.0.0.1`.
+
+**How a job runs** (`news_pipeline.py`): list candidate articles from a news search (at most 2× `max_articles`), then for each one in turn fetch it (plain text only; no HTML or screenshots are kept), check it is primarily about the ticker, and summarize it; finally bundle the summaries into an overview. Each candidate's state is stored in `job_articles` (`pending` → `fetched` → `relevant` → `done`, or `skipped` with a `reason`). Jobs run one at a time, and a job interrupted by a restart is re-queued and resumes where it left off (paused jobs stay paused). Pause and cancel take effect between steps, so an article already being fetched or summarized finishes first. Pause/resume/cancel on a job in the wrong state returns `409`; a new request identical to a paused job returns that job.
+
+**Duplicates.** After an article is fetched and before any model call, it is compared with the articles the job has already accepted. If it is a copy (a syndicated or excerpted version of the same story), it is skipped with the reason `duplicate of article <id>`, where the id is the copy that was kept; the first one in search order wins. Two articles count as copies when at least 70% of the shorter one's 5-word phrases appear in the other, or at least 25% if their titles also match. Different stories on the same topic, or from one outlet sharing site boilerplate, are kept. Reworded versions of a story are not caught.
+
+**Articles are shared across jobs.** Jobs and articles are many-to-many: `articles` holds each retrieval under its own `article_id` (URL, title, source, `published_at`, `retrieved_at`, plain text), `article_analysis` holds the per-ticker relevance verdict and summary, and `job_articles` links a job to the articles it considered. A job still searches for candidates every time, but a candidate whose URL (ignoring tracking parameters and fragments) was already retrieved is reused with its stored text, verdict and summary, so only new articles are downloaded and sent to the model. A reused article keeps its original `retrieved_at` and `article_id`, so the caller can recognize it. The `days` window is applied per job to the article's published date, so a stored article may be skipped by one job and used by another.
+
+With `"refresh": true` every candidate is downloaded again and stored as a new article entry (new `article_id`; earlier entries and earlier jobs' results are untouched). A later non-refresh job reuses the latest entry for each URL. Download failures are never stored, so they are retried next time.
+
+**Ollama failures.** A dropped connection, timeout or 5xx from Ollama is retried after 5, 20 and 60 seconds. If it is still failing, the job is **paused** (not failed) with an `error` explaining why; all progress is already saved, so `POST /jobs/{id}/resume` continues it once Ollama is back. Other errors, such as an unknown model, fail the job. In jobs, a relevance check never guesses when Ollama is down, so no unverified verdict is ever stored.
+
+An older database is migrated automatically on startup (a `.bak` copy is written first).
+
+`progress` in `GET /jobs/{id}` has the current `stage` (`queued`, `listing`, `processing`, `bundling`, `pausing`, `cancelling`, `paused`, `done`, `failed`), the article `total`, per-status `counts`, and each article's `status`, `reason`, `article_id` and `reused`. `target` is the number of articles the job aims to keep (`max_articles`), while `total` is the larger candidate count.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `API_KEY` | unset | Required `X-API-Key` value |
+| `JOBS_DB` | `~/.custom-agent/jobs.db` | SQLite job history |
+| `NEWS_MODEL` | `qwen3.6:35b` | Ollama model for everything below |
+| `NEWS_RELEVANCE_MODEL` | `NEWS_MODEL` | Model for the relevance check (a smaller one works) |
+| `NEWS_SUMMARY_MODEL` | `NEWS_MODEL` | Model for article summaries and the overview |
+| `NEWS_LLM_TIMEOUT` | `300` | Seconds to wait for one Ollama response |
+
+A finished news job's `result` has `ticker`, `generated_at`, `overview`, and `articles` (each with `article_id`, `title`, `source`, `url`, `published_at`, `retrieved_at`, `summary`), plus `skipped`.
+
+```bash
+curl -X POST -H "X-API-Key: changeme" localhost:8000/news/AAPL
+curl -H "X-API-Key: changeme" localhost:8000/jobs/<id>
+```
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+The suite covers the REST API, job store, article cache, migration, news pipeline and the `/news` skill. It runs in about two seconds and makes no network calls: Ollama, web search and page downloads are stubbed, and every test uses a temporary database (it never touches `~/.custom-agent/`). It doesn't cover the older tools, the research skill or the SEC 10-K skill.
+
 ## Changing the model
 
 Edit the `MODEL` constant at the top of `main.py`:
