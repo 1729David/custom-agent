@@ -52,10 +52,13 @@ class World:
     def url(self, name):
         return f"http://example.com/{name}"
 
-    def add(self, name, days_old=3, text="word " * 80, error=None, published=True):
+    def add(self, name, days_old=3, text=None, error=None, published=True, title=None):
         url = self.url(name)
+        title = title or f"Title {name}"
+        if text is None:  # distinct per article, so unrelated articles aren't "copies"
+            text = " ".join(f"{name}{i}" for i in range(80))
         self.candidates.append(
-            {"url": url, "title": f"Title {name}", "source": "Src",
+            {"url": url, "title": title, "source": "Src",
              "search_date": None, "snippet": None}
         )
         if error:
@@ -63,7 +66,7 @@ class World:
         else:
             when = datetime.now(timezone.utc) - timedelta(days=days_old)
             self.pages[url] = {
-                "title": f"Title {name}",
+                "title": title,
                 "text": text,
                 "published_at": when.strftime(_TS) if published else None,
                 "published_at_source": "meta_tag" if published else None,

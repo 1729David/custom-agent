@@ -297,3 +297,160 @@ def test_checkpoint_interrupts_between_steps(world, pipeline_store, monkeypatch)
         np.run_news_job(ctx, **params)
     assert exc.value.action == "cancel"
     assert world.calls["fetch"] == [world.url("a")]  # stopped before the next article
+
+
+# --- duplicates --------------------------------------------------------------
+
+
+def words(prefix, n):
+    """n distinct words, so two texts built from different prefixes share no phrases."""
+    return " ".join(f"{prefix}{i}" for i in range(n))
+
+
+def skipped_reasons(report):
+    return {s["url"].rsplit("/", 1)[1]: s["reason"] for s in report["skipped"]}
+
+
+def test_a_copy_under_another_url_is_skipped_before_any_model_call(world, pipeline_store):
+    body = words("story", 120)
+    world.add("orig", text=body)
+    world.add("copy", text=body)  # a different title and URL, but the same story
+
+    report, ctx = run_job(pipeline_store)
+
+    assert [a["title"] for a in report["articles"]] == ["Title orig"]
+    original_id = report["articles"][0]["article_id"]
+    assert skipped_reasons(report) == {"copy": f"duplicate of article {original_id}"}
+    assert world.calls["relevance"] == [("AAPL", "Title orig")]  # no wasted LLM calls
+    assert world.calls["summary"] == [("AAPL", "Title orig")]
+    assert article_rows(ctx)["copy"]["status"] == "skipped"
+
+
+def test_the_first_copy_in_search_order_wins(world, pipeline_store):
+    body = words("story", 120)
+    world.add("second_site", text=body)
+    world.add("first_site", text=body)
+    report, _ = run_job(pipeline_store)
+    assert [a["title"] for a in report["articles"]] == ["Title second_site"]
+
+
+def test_an_excerpt_of_a_longer_article_is_a_copy(world, pipeline_store):
+    body = words("story", 200)
+    world.add("full", text=body)
+    world.add("excerpt", text=" ".join(body.split()[:60]))
+    report, _ = run_job(pipeline_store)
+    assert [a["title"] for a in report["articles"]] == ["Title full"]
+
+
+def test_same_title_with_partial_overlap_is_a_copy(world, pipeline_store):
+    shared = words("shared", 30)
+    world.add("a", title="How to play AAPL stock", text=shared + " " + words("alpha", 70))
+    world.add("b", title="How to Play AAPL Stock!", text=shared + " " + words("beta", 70))
+    report, _ = run_job(pipeline_store)
+    assert len(report["articles"]) == 1 and "b" in skipped_reasons(report)
+
+
+def test_identical_generic_titles_over_different_content_are_not_copies(world, pipeline_store):
+    world.add("site_one", title="AAPL Stock Price Prediction", text=words("one", 100))
+    world.add("site_two", title="AAPL Stock Price Prediction", text=words("two", 100))
+    report, _ = run_job(pipeline_store)
+    assert len(report["articles"]) == 2 and report["skipped"] == []
+
+
+def test_partial_overlap_with_different_titles_is_not_a_copy(world, pipeline_store):
+    shared = words("shared", 30)
+    world.add("a", text=shared + " " + words("alpha", 70))
+    world.add("b", text=shared + " " + words("beta", 70))
+    report, _ = run_job(pipeline_store)
+    assert len(report["articles"]) == 2
+
+
+def test_different_stories_sharing_site_boilerplate_are_kept(world, pipeline_store):
+    """Two real articles from one outlet overlapped by ~52% (shared footer text)."""
+    boilerplate = words("footer", 50)
+    world.add("markets", text=words("markets", 50) + " " + boilerplate)
+    world.add("okx", text=words("okx", 50) + " " + boilerplate)
+    report, _ = run_job(pipeline_store)
+    assert {a["title"] for a in report["articles"]} == {"Title markets", "Title okx"}
+    assert report["skipped"] == []
+
+
+def test_copies_do_not_count_toward_max_articles(world, pipeline_store):
+    body = words("story", 120)
+    world.add("a", text=body)
+    world.add("a_copy", text=body)
+    world.add("b")
+    report, _ = run_job(pipeline_store, max_articles=2)
+    assert {a["title"] for a in report["articles"]} == {"Title a", "Title b"}
+
+
+def test_dedupe_survives_a_resume(world, pipeline_store):
+    body = words("story", 120)
+    world.add("orig", text=body)
+    world.add("copy", text=body)
+    world.summary_error = RuntimeError("model crashed")
+    ctx, params = make_ctx(pipeline_store)
+    with pytest.raises(RuntimeError):
+        np.run_news_job(ctx, **params)  # stops while "orig" is accepted but unsummarized
+
+    world.summary_error = None
+    report = np.run_news_job(ctx, **params)
+
+    assert [a["title"] for a in report["articles"]] == ["Title orig"]
+    assert "copy" in skipped_reasons(report)
+    assert world.calls["relevance"] == [("AAPL", "Title orig")]
+
+
+def test_a_later_job_reaches_the_same_decision_without_new_work(world, pipeline_store):
+    body = words("story", 120)
+    world.add("orig", text=body)
+    world.add("copy", text=body)
+    first, _ = run_job(pipeline_store)
+    keys = ("fetch", "relevance", "summary")
+    calls_after_first = {k: list(world.calls[k]) for k in keys}
+
+    second, _ = run_job(pipeline_store)
+
+    assert [a["article_id"] for a in second["articles"]] == [a["article_id"] for a in first["articles"]]
+    assert skipped_reasons(second) == skipped_reasons(first)
+    for key in keys:
+        assert world.calls[key] == calls_after_first[key]  # all reused
+
+
+# --- duplicate detection helpers ---------------------------------------------
+
+
+def entry(article_id, title, text):
+    return np._dup_entry({"article_id": article_id, "title": title, "text": text})
+
+
+def test_find_duplicate_ignores_texts_too_short_to_compare():
+    short = words("tiny", 12)  # 8 phrases
+    assert np.find_duplicate({"title": "t", "text": short}, [entry(1, "t", short)]) is None
+
+
+def test_find_duplicate_thresholds():
+    base = words("w", 100)  # 96 phrases
+    accepted = [entry(7, "Some title", base)]
+    identical = {"title": "x", "text": base}
+    assert np.find_duplicate(identical, accepted) == 7
+
+    # ~71% of the new text's phrases are in the original: just over the bar
+    over = {"title": "x", "text": " ".join(base.split()[:75]) + " " + words("n", 25)}
+    assert np.find_duplicate(over, accepted) == 7
+    # ~48% overlap: a different story
+    under = {"title": "x", "text": " ".join(base.split()[:50]) + " " + words("n", 50)}
+    assert np.find_duplicate(under, accepted) is None
+    # the same overlap with a matching title is enough
+    assert np.find_duplicate({**under, "title": "SOME title!"}, accepted) == 7
+
+
+def test_title_key_normalizes_case_and_punctuation():
+    assert np._title_key("How to Play AAPL Stock — Now!") == np._title_key("how to play aapl stock now")
+    assert np._title_key(None) == "" and np._title_key("") == ""
+
+
+def test_empty_titles_never_match_each_other():
+    base = words("w", 100)
+    other = " ".join(base.split()[:50]) + " " + words("n", 50)
+    assert np.find_duplicate({"title": "", "text": other}, [entry(1, "", base)]) is None

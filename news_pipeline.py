@@ -27,6 +27,16 @@ _MIN_TEXT_CHARS = 200
 
 # Ollama calls are retried on transient failures (dropped connection, timeout, 5xx)
 # after these delays in seconds; once they run out the job pauses so it can be resumed.
+# Duplicate detection (syndicated copies of one story). Articles are compared by the
+# share of the shorter one's 5-word phrases that appear in the other ("containment").
+# Calibrated on real articles: a true copy scored 1.00, while two different stories
+# from one outlet sharing site boilerplate scored 0.52 and everything else <= 0.45.
+_DUP_SHINGLE_WORDS = 5
+_DUP_MAX_WORDS = 3000
+_DUP_MIN_SHINGLES = 15  # shorter texts are too small to compare
+_DUP_CONTAINMENT = 0.70
+_DUP_CONTAINMENT_SAME_TITLE = 0.25  # lower bar when the titles also match
+
 _LLM_TIMEOUT = float(os.environ.get("NEWS_LLM_TIMEOUT", "300"))
 _LLM_RETRY_DELAYS = (5, 20, 60)
 
@@ -207,6 +217,49 @@ def fetch_article(candidate: dict) -> dict:
     }
 
 
+# --- Duplicate detection -----------------------------------------------------
+
+
+def _shingles(text: str) -> set[str]:
+    words = re.findall(r"\w+", text.lower())[:_DUP_MAX_WORDS]
+    n = _DUP_SHINGLE_WORDS
+    return {" ".join(words[i : i + n]) for i in range(len(words) - n + 1)}
+
+
+def _title_key(title: str | None) -> str:
+    return re.sub(r"\W+", " ", (title or "").lower()).strip()
+
+
+def _dup_entry(art: dict) -> dict:
+    """What find_duplicate needs to remember about an accepted article."""
+    return {
+        "article_id": art["article_id"],
+        "title_key": _title_key(art.get("title")),
+        "shingles": _shingles(art.get("text") or ""),
+    }
+
+
+def find_duplicate(art: dict, accepted: list[dict]) -> int | None:
+    """The article_id of an accepted article that art is a copy of, or None.
+
+    accepted holds _dup_entry() results. Catches syndicated copies and excerpts of
+    the same story; a different story on the same topic is not a duplicate.
+    """
+    shingles = _shingles(art.get("text") or "")
+    title_key = _title_key(art.get("title"))
+    for other in accepted:
+        smaller = min(len(shingles), len(other["shingles"]))
+        if smaller < _DUP_MIN_SHINGLES:
+            continue
+        containment = len(shingles & other["shingles"]) / smaller
+        same_title = bool(title_key) and title_key == other["title_key"]
+        if containment >= _DUP_CONTAINMENT or (
+            same_title and containment >= _DUP_CONTAINMENT_SAME_TITLE
+        ):
+            return other["article_id"]
+    return None
+
+
 # --- Stage 3: relevance ------------------------------------------------------
 
 
@@ -327,6 +380,10 @@ def _run_news_job(
     downloaded and sent to the model. With refresh, every candidate is downloaded
     again and stored as a new article.
 
+    An article that is a copy of one this job already accepted is skipped before any
+    model call. The first copy in search order wins; the skip reason names its
+    article_id.
+
     Job-article status advances pending -> fetched -> relevant -> done (or
     skipped), so calling this again on the same ctx resumes where the previous run
     stopped. Raises LookupError if no usable articles were found.
@@ -343,6 +400,7 @@ def _run_news_job(
 
     articles = ctx.articles()
     kept = sum(a["status"] in ("relevant", "done") for a in articles)
+    accepted = [_dup_entry(a) for a in articles if a["status"] in ("relevant", "done")]
 
     for art in articles:
         url = art["url"]
@@ -381,6 +439,10 @@ def _run_news_job(
 
         if art["status"] == "fetched":
             ctx.checkpoint()
+            original = find_duplicate(art, accepted)
+            if original is not None:
+                advance("skipped", f"duplicate of article {original}")
+                continue
             if art.get("relevant") is None:
                 relevant = check_relevance(
                     ticker, art["title"], art["text"], fail_open=False
@@ -391,6 +453,7 @@ def _run_news_job(
                 advance("skipped", f"not primarily about {ticker}")
                 continue
             kept += 1
+            accepted.append(_dup_entry(art))
             advance("relevant")
 
         if art["status"] == "relevant":
