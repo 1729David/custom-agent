@@ -40,13 +40,16 @@ _RELEVANCE_ANSWER = re.compile(r"ANSWER:\s*[*`\"' ]*(YES|NO)", re.IGNORECASE)
 # Naming the main subject before answering is what separates a real article about the
 # company from a market wrap or a list that merely includes it. Measured on 25 labeled
 # negatives and 44 positives: the one-word prompt let two roundups through (92%
-# specificity), this one let none through, at the same speed.
+# specificity), this one let none through, at the same speed. The last rule keeps out
+# quote and data pages: without it 21 of 34 such pages (TradingView, Yahoo, Nasdaq...)
+# were accepted as relevant, and with it none of the 47 Apple or 14 NVDA articles changed.
 _RELEVANCE_PROMPT = """\
 You are screening news for a sentiment feed about the company with stock ticker {ticker}. Decide whether this article is primarily about that company, meaning the company (its business, products, executives, stock, earnings, legal matters or analyst views) is the main subject.
 Answer NO if any of these apply:
 - the article is mainly about another company or topic, and {ticker} is only a comparison, example, supplier, customer or background;
 - it is a market wrap, premarket or futures roundup, or a list of several stocks, where {ticker} is one of many;
-- {ticker} appears only in the title or a ticker list while the body is about something else.
+- {ticker} appears only in the title or a ticker list while the body is about something else;
+- it is a stock quote, price chart, data table, screener, comparison tool or company-profile page, or a page of links, instead of a reported news story or analysis article.
 Answer YES only if you could summarize the article as being about {ticker}'s company.
 
 Title: {title}
@@ -364,6 +367,21 @@ def summarize_article(
 
 # --- Stage 5: bundle ---------------------------------------------------------
 
+# The bracketed date on each summary is when the article was published, which can be
+# well after the events it recaps (a later article restating an earnings report, say).
+# Without this warning the model dates events by their coverage, not when they happened.
+_OVERVIEW_PROMPT = (
+    "Below are per-article summaries of the past month of news on {ticker}, oldest "
+    "first. The bracketed date on each is when the article was published, which can "
+    "be later than the events it describes (an article may recap an earlier earnings "
+    "report, for example). Write a concise overview: key themes, notable events, and "
+    "overall tone. Give an event's date only when a summary states it (for example "
+    "'announced September 29'). When none does, write '(date not stated; covered "
+    "<period>)' instead, and never describe such an event as happening, being "
+    "reported or being announced in the period an article was published. Only use "
+    "facts from the summaries.\n\n"
+)
+
 _REPORT_FIELDS = (
     "article_id", "title", "source", "url", "published_at", "retrieved_at", "summary",
 )
@@ -376,13 +394,7 @@ def build_report(ticker: str, articles: list[dict], model: str | None = None) ->
         f"[{a['published_at'] or 'date unknown'}] {a['title']} ({a['source']})\n{a['summary']}"
         for a in ordered
     )
-    overview = _chat(
-        model or SUMMARY_MODEL,
-        f"Below are per-article summaries of the past month of news on {ticker}, "
-        "oldest first. Write a concise overview: key themes, notable events "
-        "with their dates, and overall tone. Only use facts from the summaries.\n\n"
-        + digest,
-    )
+    overview = _chat(model or SUMMARY_MODEL, _OVERVIEW_PROMPT.format(ticker=ticker) + digest)
     return {
         "ticker": ticker,
         "generated_at": _stamp(_now()),

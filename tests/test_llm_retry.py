@@ -128,6 +128,7 @@ def test_relevance_prompt_defines_the_rules_and_carries_the_article(monkeypatch)
     prompt = prompts[0]
     assert "AAPL" in prompt and "A headline" in prompt
     assert "market wrap" in prompt and "MAIN SUBJECT" in prompt and "ANSWER: YES or NO" in prompt
+    assert "stock quote, price chart, data table" in prompt  # quote pages are not news
     assert prompt.count("#") == 3000  # the article text is truncated
 
 
@@ -214,3 +215,26 @@ def test_thinking_can_be_enabled_from_the_environment(monkeypatch):
     assert importlib.reload(np)._LLM_THINK is True
     monkeypatch.delenv("NEWS_LLM_THINK")
     assert importlib.reload(np)._LLM_THINK is False
+
+
+# --- overview prompt ---------------------------------------------------------
+
+
+def test_overview_prompt_warns_that_bracketed_dates_are_publication_dates(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: prompts.append(prompt) or "OVERVIEW")
+
+    def art(i, published):
+        return {"article_id": i, "title": f"Headline {i}", "source": "Src", "url": f"u{i}",
+                "published_at": published, "retrieved_at": "r", "summary": f"Summary {i}."}
+
+    np.build_report("NVDA", [art(2, "2026-09-23T00:00:00Z"), art(1, None)])
+
+    prompt = prompts[0]
+    assert "NVDA" in prompt
+    assert "published" in prompt and "later than the events" in prompt
+    assert "date not stated" in prompt  # the wording to use when no summary gives a date
+    assert "never describe such an event as happening" in prompt
+    # the digest still carries each date and summary, undated articles first
+    assert prompt.index("[date unknown] Headline 1") < prompt.index("[2026-09-23T00:00:00Z] Headline 2")
+    assert "Summary 1." in prompt and "Summary 2." in prompt
