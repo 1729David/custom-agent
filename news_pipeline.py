@@ -37,12 +37,17 @@ _RELEVANCE_MAX_TOKENS = 60
 _RELEVANCE_TEMPERATURE = 0
 _RELEVANCE_ANSWER = re.compile(r"ANSWER:\s*[*`\"' ]*(YES|NO)", re.IGNORECASE)
 
+# Keep this wording exactly: it is the text that was measured, and borderline articles
+# (a real earnings-preview piece, say) flip verdict with punctuation-level edits.
 # Naming the main subject before answering is what separates a real article about the
 # company from a market wrap or a list that merely includes it. Measured on 25 labeled
 # negatives and 44 positives: the one-word prompt let two roundups through (92%
 # specificity), this one let none through, at the same speed. The last rule keeps out
 # quote and data pages: without it 21 of 34 such pages (TradingView, Yahoo, Nasdaq...)
 # were accepted as relevant, and with it none of the 47 Apple or 14 NVDA articles changed.
+# The investor test and consumer-content rule keep out reviews, buying guides, how-tos and
+# history pieces (the old prompt passed 15 of 21 such articles; this one passes 1) without
+# touching product-launch or business news (5 of 5 kept).
 _RELEVANCE_PROMPT = """\
 You are screening news for a sentiment feed about the company with stock ticker {ticker}. Decide whether this article is primarily about that company, meaning the company (its business, products, executives, stock, earnings, legal matters or analyst views) is the main subject.
 Answer NO if any of these apply:
@@ -50,7 +55,8 @@ Answer NO if any of these apply:
 - it is a market wrap, premarket or futures roundup, or a list of several stocks, where {ticker} is one of many;
 - {ticker} appears only in the title or a ticker list while the body is about something else;
 - it is a stock quote, price chart, data table, screener, comparison tool or company-profile page, or a page of links, instead of a reported news story or analysis article.
-Answer YES only if you could summarize the article as being about {ticker}'s company.
+- it is consumer product content, such as a review, buying guide, price or deal listing, how-to, tips list, or history or trivia piece, with no bearing on the company's business, results or stock;
+Answer YES only if the article is about {ticker}'s company AND an investor in {ticker} could learn something from it about the company's business, financial results, strategy, legal matters, products' commercial prospects, or stock. Option or model price lists, vehicle or device specifications, and stories about the company's past products teach an investor nothing. Product launches, recalls, production or sales news, and pricing changes made by the company are business news and count as YES.
 
 Title: {title}
 
@@ -374,12 +380,13 @@ _OVERVIEW_PROMPT = (
     "Below are per-article summaries of the past month of news on {ticker}, oldest "
     "first. The bracketed date on each is when the article was published, which can "
     "be later than the events it describes (an article may recap an earlier earnings "
-    "report, for example). Write a concise overview: key themes, notable events, and "
-    "overall tone. Give an event's date only when a summary states it (for example "
-    "'announced September 29'). When none does, write '(date not stated; covered "
-    "<period>)' instead, and never describe such an event as happening, being "
-    "reported or being announced in the period an article was published. Only use "
-    "facts from the summaries.\n\n"
+    "report, for example). Coverage runs from {first} to {last}. Write a concise "
+    "overview: key themes, notable events, and overall tone. Give an event's date "
+    "only when a summary states it (for example 'announced September 29'). When "
+    "none does, put '(date not stated)' after the event and do not guess a month or "
+    "period for it, and never describe such an event as happening, being reported "
+    "or being announced when an article about it was published. Only use facts from "
+    "the summaries.\n\n"
 )
 
 _REPORT_FIELDS = (
@@ -394,7 +401,11 @@ def build_report(ticker: str, articles: list[dict], model: str | None = None) ->
         f"[{a['published_at'] or 'date unknown'}] {a['title']} ({a['source']})\n{a['summary']}"
         for a in ordered
     )
-    overview = _chat(model or SUMMARY_MODEL, _OVERVIEW_PROMPT.format(ticker=ticker) + digest)
+    dates = [a["published_at"][:10] for a in ordered if a.get("published_at")]
+    prompt = _OVERVIEW_PROMPT.format(
+        ticker=ticker, first=dates[0] if dates else "unknown", last=dates[-1] if dates else "unknown"
+    )
+    overview = _chat(model or SUMMARY_MODEL, prompt + digest)
     return {
         "ticker": ticker,
         "generated_at": _stamp(_now()),

@@ -129,6 +129,9 @@ def test_relevance_prompt_defines_the_rules_and_carries_the_article(monkeypatch)
     assert "AAPL" in prompt and "A headline" in prompt
     assert "market wrap" in prompt and "MAIN SUBJECT" in prompt and "ANSWER: YES or NO" in prompt
     assert "stock quote, price chart, data table" in prompt  # quote pages are not news
+    assert "consumer product content" in prompt  # reviews, how-tos and trivia are not either
+    assert "an investor in AAPL could learn something" in prompt
+    assert "Product launches, recalls" in prompt  # genuine product news stays in
     assert prompt.count("#") == 3000  # the article text is truncated
 
 
@@ -233,8 +236,25 @@ def test_overview_prompt_warns_that_bracketed_dates_are_publication_dates(monkey
     prompt = prompts[0]
     assert "NVDA" in prompt
     assert "published" in prompt and "later than the events" in prompt
-    assert "date not stated" in prompt  # the wording to use when no summary gives a date
+    assert "(date not stated)" in prompt and "<" not in prompt.split("Headline")[0]  # no template placeholders
+    assert "do not guess a month or period" in prompt
     assert "never describe such an event as happening" in prompt
+    assert "Coverage runs from 2026-09-23 to 2026-09-23" in prompt  # the real window, undated skipped
     # the digest still carries each date and summary, undated articles first
     assert prompt.index("[date unknown] Headline 1") < prompt.index("[2026-09-23T00:00:00Z] Headline 2")
     assert "Summary 1." in prompt and "Summary 2." in prompt
+
+
+def test_overview_coverage_window_uses_the_first_and_last_dated_article(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: prompts.append(prompt) or "OVERVIEW")
+
+    def art(i, published):
+        return {"article_id": i, "title": f"H{i}", "source": "s", "url": "u", "published_at": published,
+                "retrieved_at": "r", "summary": "x"}
+
+    np.build_report("F", [art(1, "2026-10-09T10:00:00Z"), art(2, "2026-09-22T08:00:00Z"), art(3, None)])
+    assert "Coverage runs from 2026-09-22 to 2026-10-09" in prompts[0]
+
+    np.build_report("F", [art(1, None)])
+    assert "Coverage runs from unknown to unknown" in prompts[1]
