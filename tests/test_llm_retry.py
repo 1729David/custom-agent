@@ -92,8 +92,18 @@ def test_other_errors_are_not_retried(fake_ollama, sleeps, error):
 
 @pytest.mark.parametrize(
     "answer, expected",
-    [("YES", True), ("yes", True), ("**YES**", True), ('"Yes."', True),
-     ("NO", False), ("no.", False), ("**NO**", False), ("Not really", False)],
+    [
+        ("MAIN SUBJECT: Apple Inc.\nANSWER: YES", True),
+        ("MAIN SUBJECT: several companies\nANSWER: NO", False),
+        ("main subject: OKX\nanswer: no", False),
+        ("MAIN SUBJECT: Apple\nANSWER: **YES**", True),
+        ("MAIN SUBJECT: Apple\nANSWER: `NO`", False),
+        ("MAIN SUBJECT: Yes Bank\nANSWER: NO", False),  # a "yes" in the subject isn't the answer
+        ("MAIN SUBJECT: Apple\nANSWER: YES\nANSWER: NO", True),  # the first answer counts
+        # bare replies (a model ignoring the format) still work
+        ("YES", True), ("yes", True), ("**YES**", True), ('"Yes."', True),
+        ("NO", False), ("no.", False), ("**NO**", False), ("Not really", False),
+    ],
 )
 def test_relevance_answer_parsing(fake_ollama, answer, expected):
     fake_ollama.script = [answer]
@@ -109,6 +119,16 @@ def test_relevance_can_fail_closed_to_avoid_guessing(fake_ollama):
     fake_ollama.script = [DROPPED] * 4
     with pytest.raises(np.LLMUnavailable):
         np.check_relevance("AAPL", "t", "text", fail_open=False)
+
+
+def test_relevance_prompt_defines_the_rules_and_carries_the_article(monkeypatch):
+    prompts = []
+    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: prompts.append(prompt) or "ANSWER: YES")
+    np.check_relevance("AAPL", "A headline", "#" * 5000)
+    prompt = prompts[0]
+    assert "AAPL" in prompt and "A headline" in prompt
+    assert "market wrap" in prompt and "MAIN SUBJECT" in prompt and "ANSWER: YES or NO" in prompt
+    assert prompt.count("#") == 3000  # the article text is truncated
 
 
 def test_models_are_configurable(monkeypatch):
@@ -167,11 +187,24 @@ def test_reply_length_is_capped_only_when_thinking_is_off(fake_ollama, monkeypat
     assert fake_ollama.requests[-1] == {"model": "m", "think": True, "options": None}
 
 
-def test_relevance_check_asks_for_a_short_reply(monkeypatch):
+def test_relevance_check_is_short_and_repeatable(monkeypatch):
     seen = {}
-    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: seen.update(kw) or "YES")
+    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: seen.update(kw) or "ANSWER: YES")
     np.check_relevance("AAPL", "t", "text")
-    assert seen == {"max_tokens": np._RELEVANCE_MAX_TOKENS}
+    assert seen == {"max_tokens": np._RELEVANCE_MAX_TOKENS, "temperature": 0}
+
+
+def test_temperature_is_sent_only_when_thinking_is_off(fake_ollama, monkeypatch):
+    fake_ollama.script = ["ok", "ok"]
+    np._chat("m", "p", temperature=0)
+    assert fake_ollama.requests[-1]["options"] == {"temperature": 0}
+    np._chat("m", "p", max_tokens=60, temperature=0)
+    assert fake_ollama.requests[-1]["options"] == {"num_predict": 60, "temperature": 0}
+
+    monkeypatch.setattr(np, "_LLM_THINK", True)
+    fake_ollama.script = ["ok"]
+    np._chat("m", "p", max_tokens=60, temperature=0)
+    assert fake_ollama.requests[-1]["options"] is None
 
 
 def test_thinking_can_be_enabled_from_the_environment(monkeypatch):
