@@ -12,6 +12,7 @@ NEWS_RESULT = {
     "generated_at": "2026-10-06T00:00:00Z",
     "article_count": 1,
     "overview": "An overview.",
+    "sentiment": "mixed",
     "articles": [{
         "article_id": 1, "title": "A title", "source": "Src", "url": "http://x/a",
         "published_at": "2026-09-01T00:00:00Z", "retrieved_at": "2026-10-01T00:00:00Z",
@@ -147,6 +148,18 @@ def test_results_stored_before_article_ids_existed_still_list(api):
     response = api.client.get("/jobs")
     assert response.status_code == 200
     assert response.json()[0]["result"]["articles"][0]["article_id"] is None
+
+
+def test_results_stored_before_sentiment_existed_still_list(api):
+    job = post(api).json()
+    wait_until(lambda: job_status(api, job["id"]) == "done")
+    old = {k: v for k, v in NEWS_RESULT.items() if k != "sentiment"}
+    import json
+    with api.store._connect() as conn:
+        conn.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(old), job["id"]))
+    response = api.client.get("/jobs")
+    assert response.status_code == 200
+    assert response.json()[0]["result"]["sentiment"] is None
 
 
 def test_failed_job_reports_the_error(make_store, monkeypatch):

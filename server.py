@@ -50,6 +50,7 @@ class NewsResult(BaseModel):
     generated_at: str
     article_count: int
     overview: str
+    sentiment: Literal["positive", "mixed", "negative"] | None = None
     articles: list[Article]
     skipped: list[SkippedArticle]
 

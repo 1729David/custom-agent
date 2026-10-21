@@ -389,6 +389,34 @@ _OVERVIEW_PROMPT = (
     "the summaries.\n\n"
 )
 
+# Classifies the overview the reader sees, so the label matches what it says. "Mixed"
+# covers neutral too: a one-word label can't carry "bullish analysts, weak demand".
+_SENTIMENT_PROMPT = (
+    "Below is an overview of the past month of news on {ticker}. Classify its overall "
+    "tone for an investor in {ticker} as exactly one word:\n"
+    "positive - mostly favorable news, optimistic or bullish tone;\n"
+    "mixed - neutral, balanced, or favorable and unfavorable news in similar measure;\n"
+    "negative - mostly unfavorable news, cautious, skeptical or bearish tone.\n"
+    "When the overview states an overall tone, classify that stated tone: a tone "
+    "described as cautious or skeptical is negative even if some of the news is good.\n"
+    "Reply with only the word.\n\n"
+)
+SENTIMENTS = ("positive", "mixed", "negative")
+_SENTIMENT_MAX_TOKENS = 8
+
+
+def classify_sentiment(ticker: str, overview: str, model: str | None = None) -> str | None:
+    """positive, mixed or negative for an overview; None if the reply names none of them."""
+    reply = _chat(
+        model or SUMMARY_MODEL,
+        _SENTIMENT_PROMPT.format(ticker=ticker) + overview,
+        max_tokens=_SENTIMENT_MAX_TOKENS,
+        temperature=0,
+    ).lower()
+    found = [s for s in SENTIMENTS if re.search(rf"\b{s}\b", reply)]
+    return found[0] if len(found) == 1 else None
+
+
 _REPORT_FIELDS = (
     "article_id", "title", "source", "url", "published_at", "retrieved_at", "summary",
 )
@@ -411,6 +439,7 @@ def build_report(ticker: str, articles: list[dict], model: str | None = None) ->
         "generated_at": _stamp(_now()),
         "article_count": len(ordered),
         "overview": overview,
+        "sentiment": classify_sentiment(ticker, overview, model),
         "articles": [{k: a[k] for k in _REPORT_FIELDS} for a in ordered],
     }
 

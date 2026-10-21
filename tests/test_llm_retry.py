@@ -144,7 +144,7 @@ def test_models_are_configurable(monkeypatch):
     np.summarize_article("AAPL", "t", "text")
     np.build_report("AAPL", [{"published_at": None, "title": "t", "source": "s",
                               "summary": "x", "article_id": 1, "url": "u", "retrieved_at": "r"}])
-    assert used == ["small-model", "big-model", "big-model"]
+    assert used == ["small-model", "big-model", "big-model", "big-model"]  # overview, then sentiment
     np.check_relevance("AAPL", "t", "text", model="explicit")
     assert used[-1] == "explicit"
 
@@ -257,4 +257,38 @@ def test_overview_coverage_window_uses_the_first_and_last_dated_article(monkeypa
     assert "Coverage runs from 2026-09-22 to 2026-10-09" in prompts[0]
 
     np.build_report("F", [art(1, None)])
-    assert "Coverage runs from unknown to unknown" in prompts[1]
+    assert "Coverage runs from unknown to unknown" in prompts[2]  # [1] is the sentiment call
+
+
+# --- sentiment -----------------------------------------------------------------
+
+
+def test_report_classifies_the_overview_it_returns(monkeypatch):
+    calls = []
+
+    def chat(model, prompt, **kw):
+        calls.append((prompt, kw))
+        return "The overview text." if len(calls) == 1 else "Negative"
+
+    monkeypatch.setattr(np, "_chat", chat)
+    report = np.build_report("TRUP", [{"published_at": None, "title": "t", "source": "s",
+                                       "summary": "x", "article_id": 1, "url": "u", "retrieved_at": "r"}])
+    assert report["sentiment"] == "negative"
+    prompt, kw = calls[1]
+    assert "TRUP" in prompt and prompt.endswith("The overview text.")
+    assert "cautious, skeptical or bearish" in prompt  # cautious tones count as negative
+    assert kw == {"max_tokens": np._SENTIMENT_MAX_TOKENS, "temperature": 0}
+
+
+@pytest.mark.parametrize("reply, expected", [
+    ("positive", "positive"),
+    ("Mixed.", "mixed"),
+    ("  NEGATIVE\n", "negative"),
+    ("Sentiment: positive", "positive"),
+    ("positive or mixed", None),  # ambiguous replies are left unlabeled
+    ("bullish", None),
+    ("", None),
+])
+def test_sentiment_reply_is_parsed_to_one_label_or_none(monkeypatch, reply, expected):
+    monkeypatch.setattr(np, "_chat", lambda model, prompt, **kw: reply)
+    assert np.classify_sentiment("AAPL", "overview") == expected
